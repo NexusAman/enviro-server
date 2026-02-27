@@ -1,20 +1,11 @@
 require("dotenv").config();
 const express = require("express");
-const admin = require("firebase-admin");
 const axios = require("axios");
-const cron = require("node-cron");
 
 const app = express();
 app.use(express.json());
 
-// ─── Firebase Init ────────────────────────────────────────────────────────────
-const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
-// ─── Risk Thresholds (mirrors your riskThresholds.ts) ────────────────────────
+// ─── Risk Thresholds (mirrors riskThresholds.ts exactly) ─────────────────────
 const RISK_LIMITS = {
   PM25_WARNING: 12,
   PM25_SEVERE: 35,
@@ -29,7 +20,7 @@ const RISK_LIMITS = {
   WIND_DANGER: 70,
 };
 
-// ─── Risk Engine (mirrors your riskEngine.ts) ─────────────────────────────────
+// ─── Risk Engine ──────────────────────────────────────────────────────────────
 function evaluateRisk(data) {
   const alerts = [];
   const pm25 = data?.current?.air_quality?.pm2_5;
@@ -40,29 +31,24 @@ function evaluateRisk(data) {
 
   if (pm25 == null || uv == null || temp == null || visibility == null) return alerts;
 
-  // Air Quality
   if (pm25 > RISK_LIMITS.PM25_DANGER) {
     alerts.push({ type: "AirQuality_danger", severity: "danger", message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.` });
   } else if (pm25 > RISK_LIMITS.PM25_SEVERE) {
     alerts.push({ type: "AirQuality_severe", severity: "severe", message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.` });
   }
 
-  // UV
   if (uv > RISK_LIMITS.UV_DANGER) {
     alerts.push({ type: "UV_danger", severity: "danger", message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.` });
   }
 
-  // Temperature
   if (temp > RISK_LIMITS.TEMP_DANGER) {
     alerts.push({ type: "Temp_danger", severity: "danger", message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.` });
   }
 
-  // Visibility
   if (visibility < RISK_LIMITS.VISIBILITY_DANGER) {
     alerts.push({ type: "Visibility_danger", severity: "danger", message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.` });
   }
 
-  // Wind
   if (wind != null && wind > RISK_LIMITS.WIND_DANGER) {
     alerts.push({ type: "Wind_danger", severity: "danger", message: `💨 Storm-level winds — ${wind} km/h. Stay indoors.` });
   }
@@ -71,55 +57,69 @@ function evaluateRisk(data) {
 }
 
 // ─── In-memory token store ────────────────────────────────────────────────────
-// Stores: { fcmToken, latitude, longitude, lastAlertedTypes: [] }
+// { fcmToken → { fcmToken, latitude, longitude, lastAlertedTypes[] } }
 const userStore = new Map();
 
-// ─── FCM Send ─────────────────────────────────────────────────────────────────
-async function sendPushNotification(fcmToken, alert) {
+// ─── Expo Push Notification Sender ───────────────────────────────────────────
+// Uses Expo's push API — works directly with ExponentPushToken[xxx]
+// No Firebase Admin needed.
+async function sendExpoPushNotification(expoToken, alert) {
   const title = alert.severity === "danger"
     ? "🚨 Dangerous Condition"
     : "⚠️ Severe Condition";
 
   try {
-    await admin.messaging().send({
-      token: fcmToken,
-      notification: {
+    const response = await axios.post(
+      "https://exp.host/--/api/v2/push/send",
+      {
+        to: expoToken,
         title,
         body: alert.message,
-      },
-      android: {
+        sound: "default",
         priority: "high",
-        notification: {
-          color: alert.severity === "danger" ? "#E879F9" : "#F87171",
-          sound: "default",
-        },
+        data: { type: alert.type, severity: alert.severity },
       },
-      apns: {
-        payload: {
-          aps: {
-            sound: "default",
-            badge: 1,
-          },
+      {
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          "Accept-Encoding": "gzip, deflate",
         },
-      },
-    });
-    console.log(`✅ Sent [${alert.type}] to ${fcmToken.slice(0, 20)}...`);
-  } catch (err) {
-    console.warn(`❌ Failed to send to ${fcmToken.slice(0, 20)}:`, err.message);
-    // Remove invalid tokens
-    if (err.code === "messaging/invalid-registration-token" ||
-        err.code === "messaging/registration-token-not-registered") {
-      userStore.delete(fcmToken);
+      }
+    );
+
+    const result = response.data?.data;
+
+    // Expo returns per-message status — check for errors
+    if (result?.status === "error") {
+      console.warn(`❌ Expo push error for ${expoToken.slice(0, 30)}:`, result.message);
+
+      // Remove invalid tokens so they don't keep failing
+      if (
+        result.details?.error === "DeviceNotRegistered" ||
+        result.details?.error === "InvalidCredentials"
+      ) {
+        console.log(`🗑 Removing invalid token: ${expoToken.slice(0, 30)}...`);
+        userStore.delete(expoToken);
+      }
+    } else {
+      console.log(`✅ Sent [${alert.type}] to ${expoToken.slice(0, 30)}...`);
     }
+  } catch (err) {
+    console.warn(`❌ Failed to send push to ${expoToken.slice(0, 30)}:`, err.message);
   }
 }
 
-// ─── Check conditions for all registered users ────────────────────────────────
+// ─── Check all registered users ───────────────────────────────────────────────
 async function checkAllUsers() {
-  if (userStore.size === 0) return;
+  if (userStore.size === 0) {
+    console.log("ℹ️ No registered users, skipping check.");
+    return;
+  }
+
   console.log(`\n🔍 Checking ${userStore.size} user(s) at ${new Date().toLocaleTimeString()}`);
 
-  for (const [fcmToken, user] of userStore.entries()) {
+  for (const [expoToken, user] of userStore.entries()) {
     try {
       const response = await axios.get("https://api.weatherapi.com/v1/current.json", {
         params: {
@@ -129,37 +129,42 @@ async function checkAllUsers() {
         },
       });
 
-      const alerts = evaluateRisk(response.data);
-      const severeAndAbove = alerts.filter(
+      const allAlerts = evaluateRisk(response.data);
+      const severeAndAbove = allAlerts.filter(
         (a) => a.severity === "severe" || a.severity === "danger"
       );
 
-      // Only send NEW alerts — deduplication mirrors your app logic
+      // Only send NEW alerts — skip types already sent
       const newAlerts = severeAndAbove.filter(
         (a) => !user.lastAlertedTypes.includes(a.type)
       );
 
       for (const alert of newAlerts) {
-        await sendPushNotification(fcmToken, alert);
+        await sendExpoPushNotification(expoToken, alert);
       }
 
-      // Update alerted types — remove cleared, add new
+      // Update stored alert types — remove cleared ones, keep active ones
       user.lastAlertedTypes = severeAndAbove.map((a) => a.type);
 
     } catch (err) {
-      console.warn(`Failed to check user ${fcmToken.slice(0, 20)}:`, err.message);
+      console.warn(`⚠️ Failed to check user ${expoToken.slice(0, 30)}:`, err.message);
     }
   }
 }
 
-// ─── API Routes ───────────────────────────────────────────────────────────────
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
-// App calls this on launch to register the device
+// App calls this on launch with Expo push token + GPS
 app.post("/register", (req, res) => {
   const { fcmToken, latitude, longitude } = req.body;
 
   if (!fcmToken || !latitude || !longitude) {
-    return res.status(400).json({ error: "fcmToken, latitude, longitude required" });
+    return res.status(400).json({ error: "fcmToken, latitude, and longitude are required." });
+  }
+
+  // Validate it's actually an Expo push token
+  if (!fcmToken.startsWith("ExponentPushToken[")) {
+    return res.status(400).json({ error: "Invalid token format. Expected ExponentPushToken[...]." });
   }
 
   userStore.set(fcmToken, {
@@ -169,49 +174,67 @@ app.post("/register", (req, res) => {
     lastAlertedTypes: [],
   });
 
-  console.log(`📱 Registered device: ${fcmToken.slice(0, 20)}... at ${latitude}, ${longitude}`);
-  res.json({ success: true, message: "Device registered for alerts" });
+  console.log(`📱 Registered: ${fcmToken.slice(0, 35)}... at (${latitude}, ${longitude})`);
+  res.json({ success: true, message: "Device registered for push alerts." });
 });
 
-// App calls this when location changes
+// App calls this when GPS location changes
 app.post("/update-location", (req, res) => {
   const { fcmToken, latitude, longitude } = req.body;
 
-  if (!fcmToken || !userStore.has(fcmToken)) {
-    return res.status(404).json({ error: "Device not registered" });
+  if (!fcmToken || !latitude || !longitude) {
+    return res.status(400).json({ error: "fcmToken, latitude, and longitude are required." });
+  }
+
+  // Auto-register if not found — handles Render.com restarts wiping memory
+  if (!userStore.has(fcmToken)) {
+    if (!fcmToken.startsWith("ExponentPushToken[")) {
+      return res.status(400).json({ error: "Invalid token format." });
+    }
+
+    userStore.set(fcmToken, {
+      fcmToken,
+      latitude,
+      longitude,
+      lastAlertedTypes: [],
+    });
+
+    console.log(`🔄 Auto-registered on update: ${fcmToken.slice(0, 35)}...`);
+    return res.json({ success: true, message: "Device auto-registered." });
   }
 
   const user = userStore.get(fcmToken);
   user.latitude = latitude;
   user.longitude = longitude;
 
-  console.log(`📍 Updated location for ${fcmToken.slice(0, 20)}...`);
+  console.log(`📍 Location updated: ${fcmToken.slice(0, 35)}...`);
   res.json({ success: true });
 });
 
-// cron-job.org pings this every 5 minutes to trigger checks
+// cron-job.org calls this every 5 minutes
+// Secured with CRON_SECRET to prevent unauthorized triggers
 app.get("/check", async (req, res) => {
-  // Simple secret to prevent unauthorized pings
   if (req.query.secret !== process.env.CRON_SECRET) {
-    return res.status(401).json({ error: "Unauthorized" });
+    return res.status(401).json({ error: "Unauthorized." });
   }
+
   await checkAllUsers();
-  res.json({ success: true, users: userStore.size });
+  res.json({ success: true, usersChecked: userStore.size });
 });
 
-// Health check — Render.com pings this to keep server alive
+// Render.com health check — keeps server alive
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", users: userStore.size, time: new Date().toISOString() });
-});
-
-// ─── Internal cron — also runs every 5 min inside the server itself ───────────
-cron.schedule("*/5 * * * *", () => {
-  checkAllUsers();
+  res.json({
+    status: "ok",
+    users: userStore.size,
+    time: new Date().toISOString(),
+  });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🌿 Enviro Monitor server running on port ${PORT}`);
-  console.log(`📊 Checking users every 5 minutes`);
+  console.log(`📡 Using Expo Push API — no Firebase required`);
+  console.log(`⏱  Push checks triggered by cron-job.org every 5 minutes`);
 });
