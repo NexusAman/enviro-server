@@ -121,6 +121,11 @@ async function checkAllUsers() {
 
   for (const [expoToken, user] of userStore.entries()) {
     try {
+      // FIX: Skip push if app is open — app handles local notifications itself
+      if (user.appOpen) {
+        console.log(`⏭ Skipping push for ${expoToken.slice(0, 30)}... (app is open)`);
+        continue;
+      }
       const response = await axios.get("https://api.weatherapi.com/v1/current.json", {
         params: {
           key: process.env.WEATHER_API_KEY,
@@ -171,6 +176,7 @@ app.post("/register", (req, res) => {
     fcmToken,
     latitude,
     longitude,
+    appOpen: false,
     lastAlertedTypes: [],
   });
 
@@ -180,7 +186,7 @@ app.post("/register", (req, res) => {
 
 // App calls this when GPS location changes
 app.post("/update-location", (req, res) => {
-  const { fcmToken, latitude, longitude } = req.body;
+  const { fcmToken, latitude, longitude, appOpen } = req.body;
 
   if (!fcmToken || !latitude || !longitude) {
     return res.status(400).json({ error: "fcmToken, latitude, and longitude are required." });
@@ -196,6 +202,7 @@ app.post("/update-location", (req, res) => {
       fcmToken,
       latitude,
       longitude,
+      appOpen: appOpen ?? false,
       lastAlertedTypes: [],
     });
 
@@ -206,6 +213,7 @@ app.post("/update-location", (req, res) => {
   const user = userStore.get(fcmToken);
   user.latitude = latitude;
   user.longitude = longitude;
+  user.appOpen = appOpen ?? false;
 
   console.log(`📍 Location updated: ${fcmToken.slice(0, 35)}...`);
   res.json({ success: true });
