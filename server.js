@@ -1,50 +1,53 @@
-require("dotenv").config();
-const express = require("express");
-const axios = require("axios");
-const cron = require("node-cron");
-const { Redis } = require("@upstash/redis");
+import { Redis } from "@upstash/redis";
+import cron from "node-cron";
+import express from "express";
 
 const app = express();
 app.use(express.json());
 
 // ─── Upstash Redis ────────────────────────────────────────────────────────────
-// Persists across ALL server restarts, crashes, and redeploys.
-// Free tier: 10,000 req/day — more than enough.
-// Setup: upstash.com → create DB → copy UPSTASH_REDIS_REST_URL + TOKEN to Render env vars.
+
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// ─── Redis helpers ────────────────────────────────────────────────────────────
-// Each user stored as JSON at key "user:<token>"
-// All tokens tracked in a Redis Set at key "userTokens"
+// All users stored in a single Redis key as a JSON object.
+// { [fcmToken]: { fcmToken, latitude, longitude, appOpen, lastSeen } }
+// This keeps Upstash usage at ~2 commands per cron cycle instead of 50+,
+// which stays well within the free 10K/day limit even at 50 users.
 
-async function getUser(fcmToken) {
-  const raw = await redis.get(`user:${fcmToken}`);
-  return raw ? (typeof raw === "string" ? JSON.parse(raw) : raw) : null;
-}
-
-async function setUser(fcmToken, userData) {
-  await redis.set(`user:${fcmToken}`, JSON.stringify(userData));
-  await redis.sadd("userTokens", fcmToken);
-}
-
-async function deleteUser(fcmToken) {
-  await redis.del(`user:${fcmToken}`);
-  await redis.srem("userTokens", fcmToken);
-}
+const USERS_KEY = "users";
 
 async function getAllUsers() {
-  const tokens = await redis.smembers("userTokens");
-  if (!tokens || tokens.length === 0) return [];
-
-  const users = await Promise.all(tokens.map((t) => getUser(t)));
-  // Filter out any nulls (stale tokens in set with no matching data)
-  return users.filter(Boolean);
+  const data = await redis.get(USERS_KEY);
+  if (!data) return {};
+  return typeof data === "string" ? JSON.parse(data) : data;
 }
 
-// ─── Risk Thresholds (mirrors riskThresholds.ts exactly) ─────────────────────
+async function saveAllUsers(users) {
+  await redis.set(USERS_KEY, JSON.stringify(users));
+}
+
+async function getUser(token) {
+  const users = await getAllUsers();
+  return users[token] || null;
+}
+
+async function setUser(token, userData) {
+  const users = await getAllUsers();
+  users[token] = userData;
+  await saveAllUsers(users);
+}
+
+async function deleteUser(token) {
+  const users = await getAllUsers();
+  delete users[token];
+  await saveAllUsers(users);
+}
+
+// ─── Risk Thresholds (mirrors src/utils/riskThresholds.ts) ───────────────────
+
 const RISK_LIMITS = {
   PM25_WARNING: 12,
   PM25_SEVERE: 35,
@@ -59,395 +62,247 @@ const RISK_LIMITS = {
   WIND_DANGER: 70,
 };
 
-// ─── Risk Engine ──────────────────────────────────────────────────────────────
-function evaluateRisk(data) {
+function evaluateRisk(weatherData) {
   const alerts = [];
-  const pm25 = data?.current?.air_quality?.pm2_5;
-  const uv = data?.current?.uv;
-  const temp = data?.current?.temp_c;
-  const visibility = data?.current?.vis_km;
-  const wind = data?.current?.wind_kph;
+  const c = weatherData?.current;
+  if (!c) return alerts;
 
-  if (pm25 == null || uv == null || temp == null || visibility == null)
-    return alerts;
+  const pm25 = c.air_quality?.pm2_5;
+  const uv = c.uv;
+  const temp = c.temp_c;
+  const visibility = c.vis_km;
+  const wind = c.wind_kph;
 
-  if (pm25 > RISK_LIMITS.PM25_DANGER) {
-    alerts.push({
-      type: "AirQuality_danger",
-      severity: "danger",
-      message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.`,
-    });
-  } else if (pm25 > RISK_LIMITS.PM25_SEVERE) {
-    alerts.push({
-      type: "AirQuality_severe",
-      severity: "severe",
-      message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.`,
-    });
+  if (pm25 != null) {
+    if (pm25 > RISK_LIMITS.PM25_DANGER)
+      alerts.push({ type: "AirQuality_danger", severity: "danger", message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.` });
+    else if (pm25 > RISK_LIMITS.PM25_SEVERE)
+      alerts.push({ type: "AirQuality_severe", severity: "severe", message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.` });
+    else if (pm25 > RISK_LIMITS.PM25_WARNING)
+      alerts.push({ type: "AirQuality_warning", severity: "warning", message: `⚠️ Air quality declining — PM2.5 at ${pm25.toFixed(1)} µg/m³.` });
   }
 
-  if (uv > RISK_LIMITS.UV_DANGER) {
-    alerts.push({
-      type: "UV_danger",
-      severity: "danger",
-      message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.`,
-    });
+  if (uv != null) {
+    if (uv > RISK_LIMITS.UV_DANGER)
+      alerts.push({ type: "UV_danger", severity: "danger", message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.` });
+    else if (uv > RISK_LIMITS.UV_WARNING)
+      alerts.push({ type: "UV_warning", severity: "warning", message: `🌤 Moderate UV index (${uv}). Apply sunscreen before going out.` });
   }
 
-  if (temp > RISK_LIMITS.TEMP_DANGER) {
-    alerts.push({
-      type: "Temp_danger",
-      severity: "danger",
-      message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.`,
-    });
+  if (temp != null) {
+    if (temp > RISK_LIMITS.TEMP_DANGER)
+      alerts.push({ type: "Temp_danger", severity: "danger", message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.` });
+    else if (temp > RISK_LIMITS.TEMP_WARNING)
+      alerts.push({ type: "Temp_warning", severity: "warning", message: `🌡 High temperature — ${temp}°C. Stay hydrated.` });
   }
 
-  if (visibility < RISK_LIMITS.VISIBILITY_DANGER) {
-    alerts.push({
-      type: "Visibility_danger",
-      severity: "danger",
-      message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.`,
-    });
+  if (visibility != null) {
+    if (visibility < RISK_LIMITS.VISIBILITY_DANGER)
+      alerts.push({ type: "Visibility_danger", severity: "danger", message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.` });
+    else if (visibility < RISK_LIMITS.VISIBILITY_WARNING)
+      alerts.push({ type: "Visibility_warning", severity: "warning", message: `🌫 Reduced visibility — ${visibility} km. Drive with caution.` });
   }
 
-  if (wind != null && wind > RISK_LIMITS.WIND_DANGER) {
-    alerts.push({
-      type: "Wind_danger",
-      severity: "danger",
-      message: `💨 Storm-level winds — ${wind} km/h. Stay indoors.`,
-    });
+  if (wind != null) {
+    if (wind > RISK_LIMITS.WIND_DANGER)
+      alerts.push({ type: "Wind_danger", severity: "danger", message: `💨 Storm-level winds — ${wind} km/h. Avoid outdoor activity.` });
+    else if (wind > RISK_LIMITS.WIND_WARNING)
+      alerts.push({ type: "Wind_warning", severity: "warning", message: `💨 Strong winds — ${wind} km/h. Secure loose objects.` });
   }
 
   return alerts;
 }
 
-// ─── Expo Push Sender ─────────────────────────────────────────────────────────
-async function sendExpoPush(expoToken, title, body, data = {}) {
+// ─── Expo Push ────────────────────────────────────────────────────────────────
+
+async function sendPush(token, title, body, data = {}) {
   try {
-    const response = await axios.post(
-      "https://exp.host/--/api/v2/push/send",
-      {
-        to: expoToken,
-        title,
-        body,
-        sound: "default",
-        priority: "high",
-        data,
-      },
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          "Accept-Encoding": "gzip, deflate",
-        },
-      },
-    );
-
-    const result = response.data?.data;
-
-    if (result?.status === "error") {
-      console.warn(
-        `❌ Expo push error for ${expoToken.slice(0, 30)}:`,
-        result.message,
-      );
-      if (
-        result.details?.error === "DeviceNotRegistered" ||
-        result.details?.error === "InvalidCredentials"
-      ) {
-        console.log(`🗑 Removing invalid token: ${expoToken.slice(0, 30)}...`);
-        await deleteUser(expoToken);
+    const res = await fetch("https://exp.host/--/api/v2/push/send", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ to: token, title, body, data, sound: "default" }),
+    });
+    const json = await res.json();
+    if (json?.data?.status === "error") {
+      console.warn(`Push error for ${token.slice(-8)}:`, json.data.message);
+      // Invalid token — remove from store so it doesn't waste cron cycles
+      if (json.data.details?.error === "DeviceNotRegistered") {
+        await deleteUser(token);
+        console.log(`Removed unregistered token ${token.slice(-8)}`);
       }
-    } else {
-      console.log(`✅ Push sent to ${expoToken.slice(0, 30)}...`);
     }
   } catch (err) {
-    console.warn(
-      `❌ Failed to push to ${expoToken.slice(0, 30)}:`,
-      err.message,
-    );
+    console.warn("sendPush failed:", err.message);
   }
 }
 
-// ─── Fetch weather for a user ─────────────────────────────────────────────────
-async function fetchWeather(latitude, longitude) {
-  const response = await axios.get(
-    "https://api.weatherapi.com/v1/current.json",
-    {
-      params: {
-        key: process.env.WEATHER_API_KEY,
-        q: `${latitude},${longitude}`,
-        aqi: "yes",
-      },
-    },
-  );
-  return response.data;
+// ─── Weather Fetch ────────────────────────────────────────────────────────────
+
+async function fetchWeather(lat, lon) {
+  const key = process.env.WEATHER_API_KEY;
+  if (!key) throw new Error("Missing WEATHER_API_KEY env var");
+  const url = `https://api.weatherapi.com/v1/current.json?key=${key}&q=${lat},${lon}&aqi=yes`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`WeatherAPI error: ${res.status}`);
+  return res.json();
 }
 
-// ─── Risk alert check for all users (every 5 min) ────────────────────────────
-async function checkAllUsers() {
-  const users = await getAllUsers();
+// ─── Risk Check (runs every 5 min) ───────────────────────────────────────────
 
-  if (users.length === 0) {
-    console.log("ℹ️ No registered users, skipping check.");
+async function runRiskCheck() {
+  console.log(`[${new Date().toISOString()}] Running risk check…`);
+  const users = await getAllUsers();
+  const tokens = Object.keys(users);
+
+  if (tokens.length === 0) {
+    console.log("No registered users.");
     return;
   }
 
-  console.log(
-    `\n🔍 Checking ${users.length} user(s) at ${new Date().toLocaleTimeString()}`,
-  );
-
-  for (const user of users) {
+  for (const token of tokens) {
+    const user = users[token];
     try {
-      // Skip push if app is open — app handles in-app notifications itself
-      if (user.appOpen) {
-        console.log(
-          `⏭ Skipping ${user.fcmToken.slice(0, 30)}... (app is open)`,
-        );
-        continue;
-      }
-
-      const weatherData = await fetchWeather(user.latitude, user.longitude);
-      const allAlerts = evaluateRisk(weatherData);
-      const severeAndAbove = allAlerts.filter(
-        (a) => a.severity === "severe" || a.severity === "danger",
+      const weather = await fetchWeather(user.latitude, user.longitude);
+      const alerts = evaluateRisk(weather);
+      const severeAlerts = alerts.filter(
+        (a) => a.severity === "severe" || a.severity === "danger"
       );
 
-      // Only send alerts the user hasn't already received
-      const newAlerts = severeAndAbove.filter(
-        (a) => !user.lastAlertedTypes.includes(a.type),
-      );
-
-      for (const alert of newAlerts) {
+      // Only push if app is closed AND there are severe/danger alerts
+      if (!user.appOpen && severeAlerts.length > 0) {
+        const topAlert = severeAlerts[0];
         const title =
-          alert.severity === "danger"
+          topAlert.severity === "danger"
             ? "🚨 Dangerous Condition"
             : "⚠️ Severe Condition";
-        await sendExpoPush(user.fcmToken, title, alert.message, {
-          type: alert.type,
-          severity: alert.severity,
-        });
-      }
 
-      // Update alerted types — clear resolved, keep active
-      user.lastAlertedTypes = severeAndAbove.map((a) => a.type);
-      await setUser(user.fcmToken, user);
+        await sendPush(token, title, topAlert.message);
+        console.log(`Pushed alert to ${token.slice(-8)}: ${topAlert.message}`);
+      }
     } catch (err) {
-      console.warn(
-        `⚠️ Failed to check ${user.fcmToken.slice(0, 30)}:`,
-        err.message,
-      );
+      console.warn(`Risk check failed for ${token.slice(-8)}:`, err.message);
     }
   }
 }
 
-// ─── Daily summary push (every morning at 6:00 AM UTC = 11:30 AM IST) ────────
-// Sends a single morning briefing with current AQI, UV, and temp.
-// Not an alert — just a friendly daily awareness nudge.
+// ─── Daily Summary (runs at 6am UTC = 11:30am IST) ───────────────────────────
+
 async function sendDailySummary() {
+  console.log(`[${new Date().toISOString()}] Sending daily summary…`);
   const users = await getAllUsers();
+  const tokens = Object.keys(users);
 
-  if (users.length === 0) return;
-
-  console.log(
-    `\n📋 Sending daily summary to ${users.length} user(s)...`,
-  );
-
-  for (const user of users) {
+  for (const token of tokens) {
+    const user = users[token];
     try {
-      const weatherData = await fetchWeather(user.latitude, user.longitude);
+      const weather = await fetchWeather(user.latitude, user.longitude);
+      const c = weather?.current;
+      if (!c) continue;
 
-      const pm25 = weatherData?.current?.air_quality?.pm2_5;
-      const uv = weatherData?.current?.uv;
-      const temp = weatherData?.current?.temp_c;
-      const condition = weatherData?.current?.condition?.text ?? "—";
+      const pm25 = c.air_quality?.pm2_5;
+      const aqiRaw = pm25
+        ? pm25 <= 12
+          ? Math.round((50 / 12) * pm25)
+          : pm25 <= 35.4
+          ? Math.round(((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51)
+          : Math.round(((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101)
+        : null;
 
-      // Calculate AQI from PM2.5
-      let aqi = 0;
-      if (pm25 != null) {
-        if (pm25 <= 12) aqi = Math.round((50 / 12) * pm25);
-        else if (pm25 <= 35.4)
-          aqi = Math.round(((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51);
-        else if (pm25 <= 55.4)
-          aqi = Math.round(
-            ((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101,
-          );
-        else aqi = Math.round(((200 - 151) / (150.4 - 55.5)) * (pm25 - 55.5) + 151);
-      }
+      const body = [
+        aqiRaw != null ? `🌫 AQI: ${aqiRaw}` : null,
+        c.uv != null ? `☀️ UV: ${c.uv}` : null,
+        c.temp_c != null ? `🌡 Temp: ${c.temp_c}°C` : null,
+        c.condition?.text ? `🌤 ${c.condition.text}` : null,
+      ]
+        .filter(Boolean)
+        .join("  ·  ");
 
-      const aqiLabel =
-        aqi <= 50
-          ? "Good"
-          : aqi <= 100
-            ? "Moderate"
-            : aqi <= 150
-              ? "Unhealthy (Sensitive)"
-              : "Unhealthy";
-
-      const body =
-        `${condition} · AQI ${aqi} (${aqiLabel}) · UV ${uv} · ${temp}°C\n` +
-        (aqi > 100
-          ? "😷 Consider wearing a mask today."
-          : uv > 5
-            ? "🧴 Apply sunscreen before going out."
-            : "✅ Conditions look okay for outdoor activity.");
-
-      await sendExpoPush(
-        user.fcmToken,
-        "🌿 Good Morning — Daily Enviro Briefing",
-        body,
-        { type: "daily_summary" },
-      );
+      await sendPush(token, "🌿 Good Morning — Today's Air Report", body);
     } catch (err) {
-      console.warn(
-        `⚠️ Daily summary failed for ${user.fcmToken.slice(0, 30)}:`,
-        err.message,
-      );
+      console.warn(`Daily summary failed for ${token.slice(-8)}:`, err.message);
     }
   }
 }
+
+// ─── Cron Jobs ────────────────────────────────────────────────────────────────
+
+// Risk check every 5 minutes
+cron.schedule("*/5 * * * *", runRiskCheck);
+
+// Daily summary at 6am UTC (11:30am IST)
+cron.schedule("0 6 * * *", sendDailySummary);
+
+// Self-ping every 14 min — keeps Render free tier awake (prevents 50s cold start)
+cron.schedule("*/14 * * * *", () => {
+  fetch("https://enviro-server.onrender.com/health").catch(() => {});
+});
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
+// Health check — used by self-ping cron
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Register a new device
 app.post("/register", async (req, res) => {
   const { fcmToken, latitude, longitude } = req.body;
-
-  if (!fcmToken || !latitude || !longitude) {
-    return res
-      .status(400)
-      .json({ error: "fcmToken, latitude, and longitude are required." });
+  if (!fcmToken || latitude == null || longitude == null) {
+    return res.status(400).json({ error: "fcmToken, latitude, longitude required" });
   }
-
-  if (!fcmToken.startsWith("ExponentPushToken[")) {
-    return res
-      .status(400)
-      .json({ error: "Invalid token format. Expected ExponentPushToken[...]." });
-  }
-
-  // Preserve lastAlertedTypes if already registered — avoids re-sending
-  // alerts the user already received before the server restarted.
-  const existing = await getUser(fcmToken);
 
   await setUser(fcmToken, {
     fcmToken,
     latitude,
     longitude,
-    appOpen: false,
-    lastAlertedTypes: existing?.lastAlertedTypes ?? [],
+    appOpen: true,
+    lastSeen: new Date().toISOString(),
   });
 
-  console.log(
-    `📱 Registered: ${fcmToken.slice(0, 35)}... at (${latitude}, ${longitude})`,
-  );
-  res.json({ success: true, message: "Device registered for push alerts." });
-});
-
-app.post("/update-location", async (req, res) => {
-  const { fcmToken, latitude, longitude, appOpen } = req.body;
-
-  if (!fcmToken || !latitude || !longitude) {
-    return res
-      .status(400)
-      .json({ error: "fcmToken, latitude, and longitude are required." });
-  }
-
-  const existing = await getUser(fcmToken);
-
-  if (!existing) {
-    if (!fcmToken.startsWith("ExponentPushToken[")) {
-      return res.status(400).json({ error: "Invalid token format." });
-    }
-
-    await setUser(fcmToken, {
-      fcmToken,
-      latitude,
-      longitude,
-      appOpen: appOpen ?? false,
-      lastAlertedTypes: [],
-    });
-
-    console.log(`🔄 Auto-registered on update: ${fcmToken.slice(0, 35)}...`);
-    return res.json({ success: true, message: "Device auto-registered." });
-  }
-
-  // Only update fields that changed — preserve lastAlertedTypes
-  existing.latitude = latitude;
-  existing.longitude = longitude;
-  existing.appOpen = appOpen ?? false;
-
-  // NOTE: We only write to Redis on appOpen state changes to save Redis ops.
-  // Location-only updates are kept in memory for the duration of the session.
-  await setUser(fcmToken, existing);
-
-  console.log(
-    `📍 Updated: ${fcmToken.slice(0, 35)}... appOpen=${existing.appOpen}`,
-  );
+  console.log(`Registered: ${fcmToken.slice(-8)} @ ${latitude.toFixed(3)}, ${longitude.toFixed(3)}`);
   res.json({ success: true });
 });
 
-// Manual trigger (kept for debugging — cron now runs internally)
+// Update location + appOpen state
+app.post("/update-location", async (req, res) => {
+  const { fcmToken, latitude, longitude, appOpen } = req.body;
+  if (!fcmToken || latitude == null || longitude == null) {
+    return res.status(400).json({ error: "fcmToken, latitude, longitude required" });
+  }
+
+  const existing = await getUser(fcmToken);
+  await setUser(fcmToken, {
+    ...(existing || {}),
+    fcmToken,
+    latitude,
+    longitude,
+    appOpen: appOpen ?? false,
+    lastSeen: new Date().toISOString(),
+  });
+
+  res.json({ success: true });
+});
+
+// Manual risk check trigger (protected)
 app.get("/check", async (req, res) => {
-  if (req.query.secret !== process.env.CRON_SECRET) {
-    return res.status(401).json({ error: "Unauthorized." });
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
-
-  await checkAllUsers();
-  const users = await getAllUsers();
-  res.json({ success: true, usersChecked: users.length });
+  await runRiskCheck();
+  res.json({ success: true });
 });
 
-// Render.com health check
-app.get("/health", async (req, res) => {
-  const users = await getAllUsers();
-  res.json({
-    status: "ok",
-    users: users.length,
-    time: new Date().toISOString(),
-  });
-});
-
-// Debug — see all registered users
+// Debug — list all users (protected)
 app.get("/users", async (req, res) => {
-  if (req.query.secret !== process.env.CRON_SECRET) {
-    return res.status(401).json({ error: "Unauthorized." });
+  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized" });
   }
   const users = await getAllUsers();
-  res.json({
-    count: users.length,
-    users: users.map((u) => ({
-      token: u.fcmToken.slice(0, 35) + "...",
-      latitude: u.latitude,
-      longitude: u.longitude,
-      appOpen: u.appOpen,
-      alertedTypes: u.lastAlertedTypes,
-    })),
-  });
+  res.json({ count: Object.keys(users).length, users });
 });
-
-// ─── Internal Cron Jobs ───────────────────────────────────────────────────────
-// Replaces cron-job.org — runs entirely inside this process.
-// No external dependency, no secret in public URL.
-
-// Risk check: every 5 minutes
-cron.schedule("*/5 * * * *", () => {
-  console.log("⏱ [cron] Running risk check...");
-  checkAllUsers().catch((err) =>
-    console.error("❌ [cron] checkAllUsers failed:", err.message),
-  );
-});
-
-// Daily summary: every day at 6:00 AM UTC (11:30 AM IST)
-cron.schedule("0 6 * * *", () => {
-  console.log("📋 [cron] Sending daily summary...");
-  sendDailySummary().catch((err) =>
-    console.error("❌ [cron] sendDailySummary failed:", err.message),
-  );
-});
-
-console.log("⏱ Internal cron jobs scheduled (no cron-job.org needed)");
 
 // ─── Start ────────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🌿 Enviro Monitor server running on port ${PORT}`);
-  console.log(`📡 Push via Expo — no Firebase required`);
-  console.log(`💾 Persistence via Upstash Redis`);
+  console.log(`Server running on port ${PORT}`);
+  console.log(`Registered cron: risk check every 5 min, daily summary at 6am UTC, self-ping every 14 min`);
 });
