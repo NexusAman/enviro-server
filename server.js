@@ -1,9 +1,41 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
+
+// ─── Persistence ──────────────────────────────────────────────────────────────
+// Render.com free tier wipes in-memory state on every restart/redeploy.
+// We persist userStore to a JSON file so registered users survive restarts.
+// NOTE: Render's disk IS wiped on redeploy (free tier), but survives crashes
+// and idle-restarts. For true persistence across redeploys, use Upstash Redis.
+const STORE_PATH = path.join(__dirname, "userStore.json");
+
+function loadStore() {
+  try {
+    if (fs.existsSync(STORE_PATH)) {
+      const raw = fs.readFileSync(STORE_PATH, "utf-8");
+      const parsed = JSON.parse(raw);
+      // JSON doesn't preserve Map — it was saved as an array of [key, value] pairs
+      return new Map(parsed);
+    }
+  } catch (err) {
+    console.warn("⚠️ Could not load userStore from disk:", err.message);
+  }
+  return new Map();
+}
+
+function saveStore() {
+  try {
+    // Map → array of [key, value] pairs for JSON serialization
+    fs.writeFileSync(STORE_PATH, JSON.stringify([...userStore.entries()]), "utf-8");
+  } catch (err) {
+    console.warn("⚠️ Could not persist userStore to disk:", err.message);
+  }
+}
 
 // ─── Risk Thresholds (mirrors riskThresholds.ts exactly) ─────────────────────
 const RISK_LIMITS = {
@@ -56,13 +88,12 @@ function evaluateRisk(data) {
   return alerts;
 }
 
-// ─── In-memory token store ────────────────────────────────────────────────────
-// { fcmToken → { fcmToken, latitude, longitude, lastAlertedTypes[] } }
-const userStore = new Map();
+// ─── In-memory token store (loaded from disk on startup) ─────────────────────
+// { fcmToken → { fcmToken, latitude, longitude, appOpen, lastAlertedTypes[] } }
+const userStore = loadStore();
+console.log(`📂 Loaded ${userStore.size} user(s) from disk`);
 
 // ─── Expo Push Notification Sender ───────────────────────────────────────────
-// Uses Expo's push API — works directly with ExponentPushToken[xxx]
-// No Firebase Admin needed.
 async function sendExpoPushNotification(expoToken, alert) {
   const title = alert.severity === "danger"
     ? "🚨 Dangerous Condition"
@@ -90,17 +121,16 @@ async function sendExpoPushNotification(expoToken, alert) {
 
     const result = response.data?.data;
 
-    // Expo returns per-message status — check for errors
     if (result?.status === "error") {
       console.warn(`❌ Expo push error for ${expoToken.slice(0, 30)}:`, result.message);
 
-      // Remove invalid tokens so they don't keep failing
       if (
         result.details?.error === "DeviceNotRegistered" ||
         result.details?.error === "InvalidCredentials"
       ) {
         console.log(`🗑 Removing invalid token: ${expoToken.slice(0, 30)}...`);
         userStore.delete(expoToken);
+        saveStore(); // persist removal
       }
     } else {
       console.log(`✅ Sent [${alert.type}] to ${expoToken.slice(0, 30)}...`);
@@ -121,11 +151,11 @@ async function checkAllUsers() {
 
   for (const [expoToken, user] of userStore.entries()) {
     try {
-      // FIX: Skip push if app is open — app handles local notifications itself
       if (user.appOpen) {
         console.log(`⏭ Skipping push for ${expoToken.slice(0, 30)}... (app is open)`);
         continue;
       }
+
       const response = await axios.get("https://api.weatherapi.com/v1/current.json", {
         params: {
           key: process.env.WEATHER_API_KEY,
@@ -139,7 +169,6 @@ async function checkAllUsers() {
         (a) => a.severity === "severe" || a.severity === "danger"
       );
 
-      // Only send NEW alerts — skip types already sent
       const newAlerts = severeAndAbove.filter(
         (a) => !user.lastAlertedTypes.includes(a.type)
       );
@@ -148,7 +177,6 @@ async function checkAllUsers() {
         await sendExpoPushNotification(expoToken, alert);
       }
 
-      // Update stored alert types — remove cleared ones, keep active ones
       user.lastAlertedTypes = severeAndAbove.map((a) => a.type);
 
     } catch (err) {
@@ -159,7 +187,6 @@ async function checkAllUsers() {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// App calls this on launch with Expo push token + GPS
 app.post("/register", (req, res) => {
   const { fcmToken, latitude, longitude } = req.body;
 
@@ -167,24 +194,28 @@ app.post("/register", (req, res) => {
     return res.status(400).json({ error: "fcmToken, latitude, and longitude are required." });
   }
 
-  // Validate it's actually an Expo push token
   if (!fcmToken.startsWith("ExponentPushToken[")) {
     return res.status(400).json({ error: "Invalid token format. Expected ExponentPushToken[...]." });
   }
+
+  const existing = userStore.get(fcmToken);
 
   userStore.set(fcmToken, {
     fcmToken,
     latitude,
     longitude,
     appOpen: false,
-    lastAlertedTypes: [],
+    // Preserve lastAlertedTypes if already registered — avoids re-sending
+    // alerts the user already received before the server restarted.
+    lastAlertedTypes: existing?.lastAlertedTypes ?? [],
   });
+
+  saveStore(); // ← persist to disk immediately
 
   console.log(`📱 Registered: ${fcmToken.slice(0, 35)}... at (${latitude}, ${longitude})`);
   res.json({ success: true, message: "Device registered for push alerts." });
 });
 
-// App calls this when GPS location changes
 app.post("/update-location", (req, res) => {
   const { fcmToken, latitude, longitude, appOpen } = req.body;
 
@@ -192,7 +223,6 @@ app.post("/update-location", (req, res) => {
     return res.status(400).json({ error: "fcmToken, latitude, and longitude are required." });
   }
 
-  // Auto-register if not found — handles Render.com restarts wiping memory
   if (!userStore.has(fcmToken)) {
     if (!fcmToken.startsWith("ExponentPushToken[")) {
       return res.status(400).json({ error: "Invalid token format." });
@@ -206,6 +236,8 @@ app.post("/update-location", (req, res) => {
       lastAlertedTypes: [],
     });
 
+    saveStore(); // ← persist new auto-registration
+
     console.log(`🔄 Auto-registered on update: ${fcmToken.slice(0, 35)}...`);
     return res.json({ success: true, message: "Device auto-registered." });
   }
@@ -215,12 +247,15 @@ app.post("/update-location", (req, res) => {
   user.longitude = longitude;
   user.appOpen = appOpen ?? false;
 
-  console.log(`📍 Location updated: ${fcmToken.slice(0, 35)}...`);
+  // NOTE: We intentionally do NOT saveStore() here on every location update
+  // (could be every 2 minutes × N users = lots of disk writes).
+  // The user record is in memory; /register and token removal do the saves.
+
+  console.log(`📍 Location updated: ${fcmToken.slice(0, 35)}... appOpen=${user.appOpen}`);
   res.json({ success: true });
 });
 
 // cron-job.org calls this every 5 minutes
-// Secured with CRON_SECRET to prevent unauthorized triggers
 app.get("/check", async (req, res) => {
   if (req.query.secret !== process.env.CRON_SECRET) {
     return res.status(401).json({ error: "Unauthorized." });
@@ -230,13 +265,28 @@ app.get("/check", async (req, res) => {
   res.json({ success: true, usersChecked: userStore.size });
 });
 
-// Render.com health check — keeps server alive
+// Render.com health check
 app.get("/health", (req, res) => {
   res.json({
     status: "ok",
     users: userStore.size,
     time: new Date().toISOString(),
   });
+});
+
+// ─── Debug endpoint — list all registered tokens (remove before production) ──
+app.get("/users", (req, res) => {
+  if (req.query.secret !== process.env.CRON_SECRET) {
+    return res.status(401).json({ error: "Unauthorized." });
+  }
+  const users = [...userStore.values()].map((u) => ({
+    token: u.fcmToken.slice(0, 35) + "...",
+    latitude: u.latitude,
+    longitude: u.longitude,
+    appOpen: u.appOpen,
+    alertedTypes: u.lastAlertedTypes,
+  }));
+  res.json({ count: userStore.size, users });
 });
 
 // ─── Start ────────────────────────────────────────────────────────────────────
