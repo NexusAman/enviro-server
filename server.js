@@ -1,52 +1,24 @@
 import { Redis } from "@upstash/redis";
-import cron from "node-cron";
 import express from "express";
+import cron from "node-cron";
 
 const app = express();
-app.use(express.json());
-
-// ─── Upstash Redis ────────────────────────────────────────────────────────────
+app.use(express.json({ limit: "32kb" }));
 
 const redis = new Redis({
   url: process.env.UPSTASH_REDIS_REST_URL,
   token: process.env.UPSTASH_REDIS_REST_TOKEN,
 });
 
-// All users stored in a single Redis key as a JSON object.
-// { [fcmToken]: { fcmToken, latitude, longitude, appOpen, lastSeen } }
-// This keeps Upstash usage at ~2 commands per cron cycle instead of 50+,
-// which stays well within the free 10K/day limit even at 50 users.
-
 const USERS_KEY = "users";
+const PORT = Number(process.env.PORT || 3000);
+const SERVER_URL =
+  process.env.SERVER_URL || "https://enviro-server.onrender.com";
 
-async function getAllUsers() {
-  const data = await redis.get(USERS_KEY);
-  if (!data) return {};
-  return typeof data === "string" ? JSON.parse(data) : data;
-}
-
-async function saveAllUsers(users) {
-  await redis.set(USERS_KEY, JSON.stringify(users));
-}
-
-async function getUser(token) {
-  const users = await getAllUsers();
-  return users[token] || null;
-}
-
-async function setUser(token, userData) {
-  const users = await getAllUsers();
-  users[token] = userData;
-  await saveAllUsers(users);
-}
-
-async function deleteUser(token) {
-  const users = await getAllUsers();
-  delete users[token];
-  await saveAllUsers(users);
-}
-
-// ─── Risk Thresholds (mirrors src/utils/riskThresholds.ts) ───────────────────
+const APP_OPEN_TTL_MS = Number(process.env.APP_OPEN_TTL_MS || 5 * 60 * 1000);
+const STALE_USER_PRUNE_DAYS = Number(process.env.STALE_USER_PRUNE_DAYS || 14);
+const WEATHER_CONCURRENCY = Number(process.env.WEATHER_CONCURRENCY || 3);
+const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
 
 const RISK_LIMITS = {
   PM25_WARNING: 12,
@@ -62,6 +34,59 @@ const RISK_LIMITS = {
   WIND_DANGER: 70,
 };
 
+let usersWriteQueue = Promise.resolve();
+
+const maskToken = (token) => {
+  if (!token || token.length < 10) return "[invalid-token]";
+  return `${token.slice(0, 8)}...${token.slice(-6)}`;
+};
+
+const isFiniteNumber = (value) =>
+  typeof value === "number" && Number.isFinite(value);
+const isValidLat = (lat) => isFiniteNumber(lat) && lat >= -90 && lat <= 90;
+const isValidLon = (lon) => isFiniteNumber(lon) && lon >= -180 && lon <= 180;
+const isValidExpoToken = (token) =>
+  typeof token === "string" && /^ExponentPushToken\[[^\]]+\]$/.test(token);
+
+const nowIso = () => new Date().toISOString();
+
+async function getAllUsers() {
+  const data = await redis.get(USERS_KEY);
+  if (!data) return {};
+  return typeof data === "string" ? JSON.parse(data) : data;
+}
+
+async function saveAllUsers(users) {
+  await redis.set(USERS_KEY, JSON.stringify(users));
+}
+
+async function withUsersWriteLock(mutator) {
+  usersWriteQueue = usersWriteQueue.then(async () => {
+    const users = await getAllUsers();
+    const changed = await mutator(users);
+    if (changed) {
+      await saveAllUsers(users);
+    }
+  });
+  return usersWriteQueue;
+}
+
+function getCronSecret(req) {
+  const headerSecret = req.headers["x-cron-secret"];
+  const querySecret = req.query?.secret;
+  return typeof headerSecret === "string"
+    ? headerSecret
+    : typeof querySecret === "string"
+      ? querySecret
+      : null;
+}
+
+function isAuthorizedCronRequest(req) {
+  const configured = process.env.CRON_SECRET;
+  if (!configured) return false;
+  return getCronSecret(req) === configured;
+}
+
 function evaluateRisk(weatherData) {
   const alerts = [];
   const c = weatherData?.current;
@@ -74,83 +99,251 @@ function evaluateRisk(weatherData) {
   const wind = c.wind_kph;
 
   if (pm25 != null) {
-    if (pm25 > RISK_LIMITS.PM25_DANGER)
-      alerts.push({ type: "AirQuality_danger", severity: "danger", message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.` });
-    else if (pm25 > RISK_LIMITS.PM25_SEVERE)
-      alerts.push({ type: "AirQuality_severe", severity: "severe", message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.` });
-    else if (pm25 > RISK_LIMITS.PM25_WARNING)
-      alerts.push({ type: "AirQuality_warning", severity: "warning", message: `⚠️ Air quality declining — PM2.5 at ${pm25.toFixed(1)} µg/m³.` });
+    if (pm25 > RISK_LIMITS.PM25_DANGER) {
+      alerts.push({
+        type: "AirQuality_danger",
+        severity: "danger",
+        message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.`,
+      });
+    } else if (pm25 > RISK_LIMITS.PM25_SEVERE) {
+      alerts.push({
+        type: "AirQuality_severe",
+        severity: "severe",
+        message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.`,
+      });
+    } else if (pm25 > RISK_LIMITS.PM25_WARNING) {
+      alerts.push({
+        type: "AirQuality_warning",
+        severity: "warning",
+        message: `⚠️ Air quality declining — PM2.5 at ${pm25.toFixed(1)} µg/m³.`,
+      });
+    }
   }
 
   if (uv != null) {
-    if (uv > RISK_LIMITS.UV_DANGER)
-      alerts.push({ type: "UV_danger", severity: "danger", message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.` });
-    else if (uv > RISK_LIMITS.UV_WARNING)
-      alerts.push({ type: "UV_warning", severity: "warning", message: `🌤 Moderate UV index (${uv}). Apply sunscreen before going out.` });
+    if (uv > RISK_LIMITS.UV_DANGER) {
+      alerts.push({
+        type: "UV_danger",
+        severity: "danger",
+        message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.`,
+      });
+    } else if (uv > RISK_LIMITS.UV_WARNING) {
+      alerts.push({
+        type: "UV_warning",
+        severity: "warning",
+        message: `🌤 Moderate UV index (${uv}). Apply sunscreen before going out.`,
+      });
+    }
   }
 
   if (temp != null) {
-    if (temp > RISK_LIMITS.TEMP_DANGER)
-      alerts.push({ type: "Temp_danger", severity: "danger", message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.` });
-    else if (temp > RISK_LIMITS.TEMP_WARNING)
-      alerts.push({ type: "Temp_warning", severity: "warning", message: `🌡 High temperature — ${temp}°C. Stay hydrated.` });
+    if (temp > RISK_LIMITS.TEMP_DANGER) {
+      alerts.push({
+        type: "Temp_danger",
+        severity: "danger",
+        message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.`,
+      });
+    } else if (temp > RISK_LIMITS.TEMP_WARNING) {
+      alerts.push({
+        type: "Temp_warning",
+        severity: "warning",
+        message: `🌡 High temperature — ${temp}°C. Stay hydrated.`,
+      });
+    }
   }
 
   if (visibility != null) {
-    if (visibility < RISK_LIMITS.VISIBILITY_DANGER)
-      alerts.push({ type: "Visibility_danger", severity: "danger", message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.` });
-    else if (visibility < RISK_LIMITS.VISIBILITY_WARNING)
-      alerts.push({ type: "Visibility_warning", severity: "warning", message: `🌫 Reduced visibility — ${visibility} km. Drive with caution.` });
+    if (visibility < RISK_LIMITS.VISIBILITY_DANGER) {
+      alerts.push({
+        type: "Visibility_danger",
+        severity: "danger",
+        message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.`,
+      });
+    } else if (visibility < RISK_LIMITS.VISIBILITY_WARNING) {
+      alerts.push({
+        type: "Visibility_warning",
+        severity: "warning",
+        message: `🌫 Reduced visibility — ${visibility} km. Drive with caution.`,
+      });
+    }
   }
 
   if (wind != null) {
-    if (wind > RISK_LIMITS.WIND_DANGER)
-      alerts.push({ type: "Wind_danger", severity: "danger", message: `💨 Storm-level winds — ${wind} km/h. Avoid outdoor activity.` });
-    else if (wind > RISK_LIMITS.WIND_WARNING)
-      alerts.push({ type: "Wind_warning", severity: "warning", message: `💨 Strong winds — ${wind} km/h. Secure loose objects.` });
+    if (wind > RISK_LIMITS.WIND_DANGER) {
+      alerts.push({
+        type: "Wind_danger",
+        severity: "danger",
+        message: `💨 Storm-level winds — ${wind} km/h. Avoid outdoor activity.`,
+      });
+    } else if (wind > RISK_LIMITS.WIND_WARNING) {
+      alerts.push({
+        type: "Wind_warning",
+        severity: "warning",
+        message: `💨 Strong winds — ${wind} km/h. Secure loose objects.`,
+      });
+    }
   }
 
   return alerts;
 }
 
-// ─── Expo Push ────────────────────────────────────────────────────────────────
-
-async function sendPush(token, title, body, data = {}) {
-  try {
-    const res = await fetch("https://exp.host/--/api/v2/push/send", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ to: token, title, body, data, sound: "default" }),
-    });
-    const json = await res.json();
-    if (json?.data?.status === "error") {
-      console.warn(`Push error for ${token.slice(-8)}:`, json.data.message);
-      // Invalid token — remove from store so it doesn't waste cron cycles
-      if (json.data.details?.error === "DeviceNotRegistered") {
-        await deleteUser(token);
-        console.log(`Removed unregistered token ${token.slice(-8)}`);
-      }
-    }
-  } catch (err) {
-    console.warn("sendPush failed:", err.message);
+function calculateAQI(pm25) {
+  if (pm25 <= 12) return Math.round((50 / 12) * pm25);
+  if (pm25 <= 35.4) {
+    return Math.round(((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51);
   }
+  if (pm25 <= 55.4) {
+    return Math.round(((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101);
+  }
+  if (pm25 <= 150.4) {
+    return Math.round(((200 - 151) / (150.4 - 55.5)) * (pm25 - 55.5) + 151);
+  }
+  if (pm25 <= 250.4) {
+    return Math.round(((300 - 201) / (250.4 - 150.5)) * (pm25 - 150.5) + 201);
+  }
+  return Math.round(((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301);
 }
 
-// ─── Weather Fetch ────────────────────────────────────────────────────────────
+function isUserAppOpen(user) {
+  if (!user?.appOpen) return false;
+  const lastSeenMs = Date.parse(user.lastSeen || "");
+  if (!Number.isFinite(lastSeenMs)) return false;
+  return Date.now() - lastSeenMs <= APP_OPEN_TTL_MS;
+}
+
+function severeOrDanger(alert) {
+  return alert.severity === "severe" || alert.severity === "danger";
+}
+
+async function fetchWithTimeout(
+  url,
+  options = {},
+  timeoutMs = FETCH_TIMEOUT_MS,
+) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 async function fetchWeather(lat, lon) {
   const key = process.env.WEATHER_API_KEY;
   if (!key) throw new Error("Missing WEATHER_API_KEY env var");
+
   const url = `https://api.weatherapi.com/v1/current.json?key=${key}&q=${lat},${lon}&aqi=yes`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`WeatherAPI error: ${res.status}`);
-  return res.json();
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(url, {}, FETCH_TIMEOUT_MS);
+      if (!res.ok) {
+        if (res.status >= 500 && attempt < 2) {
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+        throw new Error(`WeatherAPI error: ${res.status}`);
+      }
+      return await res.json();
+    } catch (err) {
+      lastError = err;
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+        continue;
+      }
+    }
+  }
+
+  throw lastError || new Error("Weather fetch failed");
 }
 
-// ─── Risk Check (runs every 5 min) ───────────────────────────────────────────
+async function sendPush(token, title, body, data = {}) {
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const res = await fetchWithTimeout(
+        "https://exp.host/--/api/v2/push/send",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            to: token,
+            title,
+            body,
+            data,
+            sound: "default",
+          }),
+        },
+        FETCH_TIMEOUT_MS,
+      );
+
+      const json = await res.json();
+      if (json?.data?.status === "error") {
+        const errorType = json.data?.details?.error;
+        if (errorType === "DeviceNotRegistered") {
+          return {
+            ok: false,
+            deviceNotRegistered: true,
+            reason: json.data?.message || errorType,
+          };
+        }
+
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+
+        return {
+          ok: false,
+          deviceNotRegistered: false,
+          reason: json.data?.message || "push_error",
+        };
+      }
+
+      return { ok: true, deviceNotRegistered: false };
+    } catch (err) {
+      lastError = err;
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 500 * attempt));
+        continue;
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    deviceNotRegistered: false,
+    reason: lastError instanceof Error ? lastError.message : "sendPush failed",
+  };
+}
+
+async function mapWithConcurrency(items, limit, worker) {
+  const max = Math.max(1, limit);
+  const active = [];
+  let index = 0;
+
+  async function runOne() {
+    if (index >= items.length) return;
+    const current = index;
+    index += 1;
+    await worker(items[current], current);
+    await runOne();
+  }
+
+  for (let i = 0; i < Math.min(max, items.length); i += 1) {
+    active.push(runOne());
+  }
+
+  await Promise.all(active);
+}
 
 async function runRiskCheck() {
-  console.log(`[${new Date().toISOString()}] Running risk check…`);
+  const started = Date.now();
+  console.log(`[${nowIso()}] Running risk check...`);
+
   const users = await getAllUsers();
   const tokens = Object.keys(users);
 
@@ -159,54 +352,103 @@ async function runRiskCheck() {
     return;
   }
 
-  for (const token of tokens) {
+  let changed = false;
+  const targets = tokens.filter((token) => {
     const user = users[token];
+    if (!user) return false;
+    if (!isValidLat(user.latitude) || !isValidLon(user.longitude)) return false;
+    return !isUserAppOpen(user);
+  });
+
+  await mapWithConcurrency(targets, WEATHER_CONCURRENCY, async (token) => {
+    const user = users[token];
+    if (!user) return;
+
     try {
       const weather = await fetchWeather(user.latitude, user.longitude);
       const alerts = evaluateRisk(weather);
-      const severeAlerts = alerts.filter(
-        (a) => a.severity === "severe" || a.severity === "danger"
+      const severeAlerts = alerts.filter(severeOrDanger);
+      const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
+      const previousActiveTypes = Array.isArray(user.activeAlertTypes)
+        ? [...user.activeAlertTypes].sort()
+        : [];
+
+      const newlyTriggered = severeAlerts.filter(
+        (alert) => !previousActiveTypes.includes(alert.type),
       );
 
-      // Only push if app is closed AND there are severe/danger alerts
-      if (!user.appOpen && severeAlerts.length > 0) {
-        const topAlert = severeAlerts[0];
+      if (newlyTriggered.length > 0) {
+        const topAlert = newlyTriggered[0];
         const title =
           topAlert.severity === "danger"
             ? "🚨 Dangerous Condition"
             : "⚠️ Severe Condition";
 
-        await sendPush(token, title, topAlert.message);
-        console.log(`Pushed alert to ${token.slice(-8)}: ${topAlert.message}`);
+        const pushed = await sendPush(token, title, topAlert.message, {
+          type: topAlert.type,
+          severity: topAlert.severity,
+        });
+
+        if (pushed.deviceNotRegistered) {
+          delete users[token];
+          changed = true;
+          console.log(`Removed unregistered token ${maskToken(token)}`);
+          return;
+        }
+
+        if (!pushed.ok) {
+          console.warn(`Push failed for ${maskToken(token)}: ${pushed.reason}`);
+        } else {
+          console.log(`Pushed ${topAlert.type} to ${maskToken(token)}`);
+        }
+      }
+
+      const hasTypeChange =
+        JSON.stringify(previousActiveTypes) !== JSON.stringify(nextActiveTypes);
+      if (hasTypeChange || user.lastRiskCheckAt == null) {
+        users[token] = {
+          ...user,
+          activeAlertTypes: nextActiveTypes,
+          lastRiskCheckAt: nowIso(),
+        };
+        changed = true;
       }
     } catch (err) {
-      console.warn(`Risk check failed for ${token.slice(-8)}:`, err.message);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Risk check failed for ${maskToken(token)}: ${msg}`);
     }
+  });
+
+  if (changed) {
+    await saveAllUsers(users);
   }
+
+  console.log(
+    `Risk check complete: total=${tokens.length}, checked=${targets.length}, ms=${Date.now() - started}`,
+  );
 }
 
-// ─── Daily Summary (runs at 6am UTC = 11:30am IST) ───────────────────────────
-
 async function sendDailySummary() {
-  console.log(`[${new Date().toISOString()}] Sending daily summary…`);
-  const users = await getAllUsers();
-  const tokens = Object.keys(users);
+  const started = Date.now();
+  console.log(`[${nowIso()}] Sending daily summary...`);
 
-  for (const token of tokens) {
+  const users = await getAllUsers();
+  const tokens = Object.keys(users).filter((token) => {
+    const u = users[token];
+    return u && isValidLat(u.latitude) && isValidLon(u.longitude);
+  });
+
+  await mapWithConcurrency(tokens, WEATHER_CONCURRENCY, async (token) => {
     const user = users[token];
+    if (!user) return;
+
     try {
       const weather = await fetchWeather(user.latitude, user.longitude);
       const c = weather?.current;
-      if (!c) continue;
+      if (!c) return;
 
       const pm25 = c.air_quality?.pm2_5;
-      const aqiRaw = pm25
-        ? pm25 <= 12
-          ? Math.round((50 / 12) * pm25)
-          : pm25 <= 35.4
-          ? Math.round(((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51)
-          : Math.round(((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101)
-        : null;
+      const aqiRaw = pm25 != null ? calculateAQI(pm25) : null;
 
       const body = [
         aqiRaw != null ? `🌫 AQI: ${aqiRaw}` : null,
@@ -217,92 +459,189 @@ async function sendDailySummary() {
         .filter(Boolean)
         .join("  ·  ");
 
-      await sendPush(token, "🌿 Good Morning — Today's Air Report", body);
+      const pushed = await sendPush(
+        token,
+        "🌿 Good Morning — Today's Air Report",
+        body,
+      );
+      if (pushed.deviceNotRegistered) {
+        delete users[token];
+        console.log(`Removed unregistered token ${maskToken(token)}`);
+        return;
+      }
+      if (!pushed.ok) {
+        console.warn(
+          `Daily summary push failed for ${maskToken(token)}: ${pushed.reason}`,
+        );
+      }
     } catch (err) {
-      console.warn(`Daily summary failed for ${token.slice(-8)}:`, err.message);
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Daily summary failed for ${maskToken(token)}: ${msg}`);
     }
+  });
+
+  await saveAllUsers(users);
+
+  console.log(
+    `Daily summary complete: users=${tokens.length}, ms=${Date.now() - started}`,
+  );
+}
+
+async function pruneStaleUsers() {
+  const users = await getAllUsers();
+  const tokens = Object.keys(users);
+  if (tokens.length === 0) return;
+
+  const cutoffMs = Date.now() - STALE_USER_PRUNE_DAYS * 24 * 60 * 60 * 1000;
+  let removed = 0;
+
+  for (const token of tokens) {
+    const user = users[token];
+    const seenMs = Date.parse(user?.lastSeen || "");
+    if (!Number.isFinite(seenMs) || seenMs < cutoffMs) {
+      delete users[token];
+      removed += 1;
+    }
+  }
+
+  if (removed > 0) {
+    await saveAllUsers(users);
+    console.log(`Pruned ${removed} stale users`);
   }
 }
 
-// ─── Cron Jobs ────────────────────────────────────────────────────────────────
-
-// Risk check every 5 minutes
-cron.schedule("*/5 * * * *", runRiskCheck);
-
-// Daily summary at 6am UTC (11:30am IST)
-cron.schedule("0 6 * * *", sendDailySummary);
-
-// Self-ping every 14 min — keeps Render free tier awake (prevents 50s cold start)
-cron.schedule("*/14 * * * *", () => {
-  fetch("https://enviro-server.onrender.com/health").catch(() => {});
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    uptimeSec: Math.round(process.uptime()),
+    now: nowIso(),
+  });
 });
 
-// ─── Routes ───────────────────────────────────────────────────────────────────
-
-// Health check — used by self-ping cron
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// Register a new device
 app.post("/register", async (req, res) => {
-  const { fcmToken, latitude, longitude } = req.body;
-  if (!fcmToken || latitude == null || longitude == null) {
-    return res.status(400).json({ error: "fcmToken, latitude, longitude required" });
+  const { fcmToken, latitude, longitude } = req.body || {};
+
+  if (
+    !isValidExpoToken(fcmToken) ||
+    !isValidLat(latitude) ||
+    !isValidLon(longitude)
+  ) {
+    return res.status(400).json({
+      error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
+    });
   }
 
-  await setUser(fcmToken, {
-    fcmToken,
-    latitude,
-    longitude,
-    appOpen: true,
-    lastSeen: new Date().toISOString(),
+  await withUsersWriteLock(async (users) => {
+    users[fcmToken] = {
+      ...(users[fcmToken] || {}),
+      fcmToken,
+      latitude,
+      longitude,
+      appOpen: true,
+      activeAlertTypes: Array.isArray(users[fcmToken]?.activeAlertTypes)
+        ? users[fcmToken].activeAlertTypes
+        : [],
+      lastSeen: nowIso(),
+      registeredAt: users[fcmToken]?.registeredAt || nowIso(),
+    };
+    return true;
   });
 
-  console.log(`Registered: ${fcmToken.slice(-8)} @ ${latitude.toFixed(3)}, ${longitude.toFixed(3)}`);
-  res.json({ success: true });
+  console.log(
+    `Registered ${maskToken(fcmToken)} @ ${latitude.toFixed(3)}, ${longitude.toFixed(3)}`,
+  );
+  return res.json({ success: true });
 });
 
-// Update location + appOpen state
 app.post("/update-location", async (req, res) => {
-  const { fcmToken, latitude, longitude, appOpen } = req.body;
-  if (!fcmToken || latitude == null || longitude == null) {
-    return res.status(400).json({ error: "fcmToken, latitude, longitude required" });
+  const { fcmToken, latitude, longitude, appOpen } = req.body || {};
+
+  if (
+    !isValidExpoToken(fcmToken) ||
+    !isValidLat(latitude) ||
+    !isValidLon(longitude)
+  ) {
+    return res.status(400).json({
+      error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
+    });
   }
 
-  const existing = await getUser(fcmToken);
-  await setUser(fcmToken, {
-    ...(existing || {}),
-    fcmToken,
-    latitude,
-    longitude,
-    appOpen: appOpen ?? false,
-    lastSeen: new Date().toISOString(),
+  await withUsersWriteLock(async (users) => {
+    const existing = users[fcmToken] || {};
+    users[fcmToken] = {
+      ...existing,
+      fcmToken,
+      latitude,
+      longitude,
+      appOpen: typeof appOpen === "boolean" ? appOpen : false,
+      activeAlertTypes: Array.isArray(existing.activeAlertTypes)
+        ? existing.activeAlertTypes
+        : [],
+      lastSeen: nowIso(),
+    };
+    return true;
   });
 
-  res.json({ success: true });
+  return res.json({ success: true });
 });
 
-// Manual risk check trigger (protected)
 app.get("/check", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+  if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+
   await runRiskCheck();
-  res.json({ success: true });
+  return res.json({ success: true });
 });
 
-// Debug — list all users (protected)
 app.get("/users", async (req, res) => {
-  if (req.headers["x-cron-secret"] !== process.env.CRON_SECRET) {
+  if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+
   const users = await getAllUsers();
-  res.json({ count: Object.keys(users).length, users });
+  const list = Object.values(users).map((u) => ({
+    token: maskToken(u.fcmToken),
+    latitude: u.latitude,
+    longitude: u.longitude,
+    appOpen: isUserAppOpen(u),
+    lastSeen: u.lastSeen,
+    activeAlertTypes: Array.isArray(u.activeAlertTypes)
+      ? u.activeAlertTypes
+      : [],
+  }));
+
+  return res.json({ count: list.length, users: list });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+cron.schedule("*/5 * * * *", () => {
+  runRiskCheck().catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("risk cron failed:", msg);
+  });
+});
 
-const PORT = process.env.PORT || 3000;
+cron.schedule("0 6 * * *", () => {
+  sendDailySummary().catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("daily summary cron failed:", msg);
+  });
+});
+
+cron.schedule("30 2 * * *", () => {
+  pruneStaleUsers().catch((err) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn("prune cron failed:", msg);
+  });
+});
+
+if (process.env.ENABLE_SELF_PING === "true") {
+  cron.schedule("*/14 * * * *", () => {
+    fetch(`${SERVER_URL}/health`).catch(() => {});
+  });
+}
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Registered cron: risk check every 5 min, daily summary at 6am UTC, self-ping every 14 min`);
+  console.log("Cron: risk=every 5 min, summary=06:00 UTC, prune=02:30 UTC");
 });
