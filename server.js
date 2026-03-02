@@ -19,6 +19,21 @@ const APP_OPEN_TTL_MS = Number(process.env.APP_OPEN_TTL_MS || 5 * 60 * 1000);
 const STALE_USER_PRUNE_DAYS = Number(process.env.STALE_USER_PRUNE_DAYS || 14);
 const WEATHER_CONCURRENCY = Number(process.env.WEATHER_CONCURRENCY || 3);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
+const WEATHER_CACHE_TTL_MS = Number(
+  process.env.WEATHER_CACHE_TTL_MS || 90 * 1000,
+);
+const WEATHER_CACHE_COORD_PRECISION = Number(
+  process.env.WEATHER_CACHE_COORD_PRECISION || 3,
+);
+const WEATHER_CACHE_MAX_ENTRIES = Number(
+  process.env.WEATHER_CACHE_MAX_ENTRIES || 2000,
+);
+const LOCATION_UPDATE_MIN_INTERVAL_MS = Number(
+  process.env.LOCATION_UPDATE_MIN_INTERVAL_MS || 45 * 1000,
+);
+const LOCATION_JITTER_THRESHOLD = Number(
+  process.env.LOCATION_JITTER_THRESHOLD || 0.0001,
+);
 
 const RISK_LIMITS = {
   PM25_WARNING: 12,
@@ -36,6 +51,24 @@ const RISK_LIMITS = {
 
 let usersWriteQueue = Promise.resolve();
 
+const runtimeStats = {
+  updateLocationRequests: 0,
+  updateLocationSkipped: 0,
+  updateLocationApplied: 0,
+  registerRequests: 0,
+  riskChecksRun: 0,
+  riskChecksLastMs: 0,
+  riskChecksLastCheckedUsers: 0,
+  dailySummariesRun: 0,
+  dailySummariesLastMs: 0,
+  prunesRun: 0,
+  prunesLastRemoved: 0,
+  weatherCacheHits: 0,
+  weatherCacheMisses: 0,
+};
+
+const weatherCache = new Map();
+
 const maskToken = (token) => {
   if (!token || token.length < 10) return "[invalid-token]";
   return `${token.slice(0, 8)}...${token.slice(-6)}`;
@@ -47,6 +80,36 @@ const isValidLat = (lat) => isFiniteNumber(lat) && lat >= -90 && lat <= 90;
 const isValidLon = (lon) => isFiniteNumber(lon) && lon >= -180 && lon <= 180;
 const isValidExpoToken = (token) =>
   typeof token === "string" && /^ExponentPushToken\[[^\]]+\]$/.test(token);
+
+const isNearlySameLocation = (prevLat, prevLon, nextLat, nextLon) => {
+  return (
+    Math.abs(prevLat - nextLat) < LOCATION_JITTER_THRESHOLD &&
+    Math.abs(prevLon - nextLon) < LOCATION_JITTER_THRESHOLD
+  );
+};
+
+const getWeatherCacheKey = (lat, lon) => {
+  return `${lat.toFixed(WEATHER_CACHE_COORD_PRECISION)},${lon.toFixed(WEATHER_CACHE_COORD_PRECISION)}`;
+};
+
+const pruneWeatherCache = () => {
+  const now = Date.now();
+  for (const [key, value] of weatherCache.entries()) {
+    if (now - value.cachedAt > WEATHER_CACHE_TTL_MS) {
+      weatherCache.delete(key);
+    }
+  }
+
+  if (weatherCache.size <= WEATHER_CACHE_MAX_ENTRIES) return;
+
+  const entries = Array.from(weatherCache.entries()).sort(
+    (a, b) => a[1].cachedAt - b[1].cachedAt,
+  );
+  const removeCount = weatherCache.size - WEATHER_CACHE_MAX_ENTRIES;
+  for (let i = 0; i < removeCount; i += 1) {
+    weatherCache.delete(entries[i][0]);
+  }
+};
 
 const nowIso = () => new Date().toISOString();
 
@@ -233,6 +296,15 @@ async function fetchWeather(lat, lon) {
   const key = process.env.WEATHER_API_KEY;
   if (!key) throw new Error("Missing WEATHER_API_KEY env var");
 
+  const cacheKey = getWeatherCacheKey(lat, lon);
+  const cached = weatherCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt <= WEATHER_CACHE_TTL_MS) {
+    runtimeStats.weatherCacheHits += 1;
+    return cached.data;
+  }
+
+  runtimeStats.weatherCacheMisses += 1;
+
   const url = `https://api.weatherapi.com/v1/current.json?key=${key}&q=${lat},${lon}&aqi=yes`;
   let lastError = null;
 
@@ -246,7 +318,10 @@ async function fetchWeather(lat, lon) {
         }
         throw new Error(`WeatherAPI error: ${res.status}`);
       }
-      return await res.json();
+      const data = await res.json();
+      weatherCache.set(cacheKey, { data, cachedAt: Date.now() });
+      pruneWeatherCache();
+      return data;
     } catch (err) {
       lastError = err;
       if (attempt < 2) {
@@ -342,6 +417,7 @@ async function mapWithConcurrency(items, limit, worker) {
 
 async function runRiskCheck() {
   const started = Date.now();
+  runtimeStats.riskChecksRun += 1;
   console.log(`[${nowIso()}] Running risk check...`);
 
   const users = await getAllUsers();
@@ -426,10 +502,13 @@ async function runRiskCheck() {
   console.log(
     `Risk check complete: total=${tokens.length}, checked=${targets.length}, ms=${Date.now() - started}`,
   );
+  runtimeStats.riskChecksLastCheckedUsers = targets.length;
+  runtimeStats.riskChecksLastMs = Date.now() - started;
 }
 
 async function sendDailySummary() {
   const started = Date.now();
+  runtimeStats.dailySummariesRun += 1;
   console.log(`[${nowIso()}] Sending daily summary...`);
 
   const users = await getAllUsers();
@@ -438,6 +517,7 @@ async function sendDailySummary() {
     return u && isValidLat(u.latitude) && isValidLon(u.longitude);
   });
 
+  let changed = false;
   await mapWithConcurrency(tokens, WEATHER_CONCURRENCY, async (token) => {
     const user = users[token];
     if (!user) return;
@@ -466,6 +546,7 @@ async function sendDailySummary() {
       );
       if (pushed.deviceNotRegistered) {
         delete users[token];
+        changed = true;
         console.log(`Removed unregistered token ${maskToken(token)}`);
         return;
       }
@@ -480,14 +561,18 @@ async function sendDailySummary() {
     }
   });
 
-  await saveAllUsers(users);
+  if (changed) {
+    await saveAllUsers(users);
+  }
 
   console.log(
     `Daily summary complete: users=${tokens.length}, ms=${Date.now() - started}`,
   );
+  runtimeStats.dailySummariesLastMs = Date.now() - started;
 }
 
 async function pruneStaleUsers() {
+  runtimeStats.prunesRun += 1;
   const users = await getAllUsers();
   const tokens = Object.keys(users);
   if (tokens.length === 0) return;
@@ -508,6 +593,8 @@ async function pruneStaleUsers() {
     await saveAllUsers(users);
     console.log(`Pruned ${removed} stale users`);
   }
+
+  runtimeStats.prunesLastRemoved = removed;
 }
 
 app.get("/health", (_req, res) => {
@@ -519,6 +606,7 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/register", async (req, res) => {
+  runtimeStats.registerRequests += 1;
   const { fcmToken, latitude, longitude } = req.body || {};
 
   if (
@@ -554,6 +642,7 @@ app.post("/register", async (req, res) => {
 });
 
 app.post("/update-location", async (req, res) => {
+  runtimeStats.updateLocationRequests += 1;
   const { fcmToken, latitude, longitude, appOpen } = req.body || {};
 
   if (
@@ -566,23 +655,53 @@ app.post("/update-location", async (req, res) => {
     });
   }
 
+  let skipped = false;
+
   await withUsersWriteLock(async (users) => {
     const existing = users[fcmToken] || {};
+    const nextAppOpen = typeof appOpen === "boolean" ? appOpen : false;
+
+    if (
+      typeof existing.latitude === "number" &&
+      typeof existing.longitude === "number" &&
+      typeof existing.appOpen === "boolean" &&
+      typeof existing.lastSeen === "string"
+    ) {
+      const lastSeenMs = Date.parse(existing.lastSeen);
+      const recentlyUpdated =
+        Number.isFinite(lastSeenMs) &&
+        Date.now() - lastSeenMs < LOCATION_UPDATE_MIN_INTERVAL_MS;
+      const sameAppState = existing.appOpen === nextAppOpen;
+      const sameLocation = isNearlySameLocation(
+        existing.latitude,
+        existing.longitude,
+        latitude,
+        longitude,
+      );
+
+      if (recentlyUpdated && sameAppState && sameLocation) {
+        skipped = true;
+        runtimeStats.updateLocationSkipped += 1;
+        return false;
+      }
+    }
+
     users[fcmToken] = {
       ...existing,
       fcmToken,
       latitude,
       longitude,
-      appOpen: typeof appOpen === "boolean" ? appOpen : false,
+      appOpen: nextAppOpen,
       activeAlertTypes: Array.isArray(existing.activeAlertTypes)
         ? existing.activeAlertTypes
         : [],
       lastSeen: nowIso(),
     };
+    runtimeStats.updateLocationApplied += 1;
     return true;
   });
 
-  return res.json({ success: true });
+  return res.json({ success: true, skipped });
 });
 
 app.get("/check", async (req, res) => {
@@ -612,6 +731,50 @@ app.get("/users", async (req, res) => {
   }));
 
   return res.json({ count: list.length, users: list });
+});
+
+app.get("/stats", async (req, res) => {
+  if (!isAuthorizedCronRequest(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const users = await getAllUsers();
+  const all = Object.values(users);
+  const activeUsers = all.filter((u) => isUserAppOpen(u)).length;
+
+  return res.json({
+    now: nowIso(),
+    users: {
+      total: all.length,
+      active: activeUsers,
+      inactive: all.length - activeUsers,
+    },
+    updates: {
+      requests: runtimeStats.updateLocationRequests,
+      applied: runtimeStats.updateLocationApplied,
+      skipped: runtimeStats.updateLocationSkipped,
+    },
+    jobs: {
+      riskChecksRun: runtimeStats.riskChecksRun,
+      riskChecksLastMs: runtimeStats.riskChecksLastMs,
+      riskChecksLastCheckedUsers: runtimeStats.riskChecksLastCheckedUsers,
+      dailySummariesRun: runtimeStats.dailySummariesRun,
+      dailySummariesLastMs: runtimeStats.dailySummariesLastMs,
+      prunesRun: runtimeStats.prunesRun,
+      prunesLastRemoved: runtimeStats.prunesLastRemoved,
+    },
+    cache: {
+      weatherEntries: weatherCache.size,
+      ttlMs: WEATHER_CACHE_TTL_MS,
+      coordPrecision: WEATHER_CACHE_COORD_PRECISION,
+      hits: runtimeStats.weatherCacheHits,
+      misses: runtimeStats.weatherCacheMisses,
+    },
+    registers: {
+      requests: runtimeStats.registerRequests,
+    },
+    uptimeSec: Math.round(process.uptime()),
+  });
 });
 
 cron.schedule("*/5 * * * *", () => {
