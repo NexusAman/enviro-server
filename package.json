@@ -1,6 +1,7 @@
 {
   "name": "enviro-monitor-server",
   "version": "2.0.0",
+  "type": "module",
   "description": "Background alert server for Enviro Monitor app",
   "main": "server.js",
   "scripts": {
@@ -9,9 +10,7 @@
   },
   "dependencies": {
     "@upstash/redis": "^1.31.6",
-    "axios": "^1.6.0",
     "express": "^4.18.0",
-    "node-cron": "^3.0.0",
-    "dotenv": "^16.0.0"
+    "node-cron": "^3.0.0"
   }
 }
