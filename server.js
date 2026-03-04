@@ -872,14 +872,14 @@ cron.schedule("*/5 * * * *", () => {
   });
 });
 
-cron.schedule("0 6 * * *", () => {
+cron.schedule("30 0 * * *", () => {
   sendDailySummary().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("daily summary cron failed:", msg);
   });
 });
 
-cron.schedule("30 2 * * *", () => {
+cron.schedule("0 22 * * *", () => {
   pruneStaleUsers().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("prune cron failed:", msg);
