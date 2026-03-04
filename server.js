@@ -136,7 +136,7 @@ async function saveAllUsers(users) {
 }
 
 async function withUsersWriteLock(mutator) {
-  usersWriteQueue = usersWriteQueue.then(async () => {
+  usersWriteQueue = usersWriteQueue.catch(() => { }).then(async () => {
     const users = await getAllUsers();
     const changed = await mutator(users);
     if (changed) {
@@ -504,89 +504,93 @@ async function runRiskCheck() {
   runtimeStats.riskChecksRun += 1;
   console.log(`[${nowIso()}] Running risk check...`);
 
-  const users = await getAllUsers();
-  const tokens = Object.keys(users);
+  let totalUsers = 0;
+  let checkedUsers = 0;
 
-  if (tokens.length === 0) {
-    console.log("No registered users.");
-    return;
-  }
+  await withUsersWriteLock(async (users) => {
+    const tokens = Object.keys(users);
+    totalUsers = tokens.length;
 
-  let changed = false;
-  const targets = tokens.filter((token) => {
-    const user = users[token];
-    if (!user) return false;
-    if (!isValidLat(user.latitude) || !isValidLon(user.longitude)) return false;
-    return !isUserAppOpen(user);
-  });
-
-  await mapWithConcurrency(targets, WEATHER_CONCURRENCY, async (token) => {
-    const user = users[token];
-    if (!user) return;
-
-    try {
-      const weather = await fetchWeather(user.latitude, user.longitude);
-      const alerts = evaluateRisk(weather);
-      const severeAlerts = alerts.filter(severeOrDanger);
-      const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
-      const previousActiveTypes = Array.isArray(user.activeAlertTypes)
-        ? [...user.activeAlertTypes].sort()
-        : [];
-
-      const newlyTriggered = severeAlerts.filter(
-        (alert) => !previousActiveTypes.includes(alert.type),
-      );
-
-      if (newlyTriggered.length > 0) {
-        const topAlert = newlyTriggered[0];
-        const title =
-          topAlert.severity === "danger"
-            ? "🚨 Dangerous Condition"
-            : "⚠️ Severe Condition";
-
-        const pushed = await sendPush(token, title, topAlert.message, {
-          type: topAlert.type,
-          severity: topAlert.severity,
-        });
-
-        if (pushed.deviceNotRegistered) {
-          delete users[token];
-          changed = true;
-          console.log(`Removed unregistered token ${maskToken(token)}`);
-          return;
-        }
-
-        if (!pushed.ok) {
-          console.warn(`Push failed for ${maskToken(token)}: ${pushed.reason}`);
-        } else {
-          console.log(`Pushed ${topAlert.type} to ${maskToken(token)}`);
-        }
-      }
-
-      const hasTypeChange =
-        JSON.stringify(previousActiveTypes) !== JSON.stringify(nextActiveTypes);
-      if (hasTypeChange || user.lastRiskCheckAt == null) {
-        users[token] = {
-          ...user,
-          activeAlertTypes: nextActiveTypes,
-          lastRiskCheckAt: nowIso(),
-        };
-        changed = true;
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`Risk check failed for ${maskToken(token)}: ${msg}`);
+    if (tokens.length === 0) {
+      console.log("No registered users.");
+      return false;
     }
-  });
 
-  if (changed) {
-    await saveAllUsers(users);
-  }
+    let changed = false;
+    const targets = tokens.filter((token) => {
+      const user = users[token];
+      if (!user) return false;
+      if (!isValidLat(user.latitude) || !isValidLon(user.longitude)) return false;
+      return !isUserAppOpen(user);
+    });
+    checkedUsers = targets.length;
+
+    await mapWithConcurrency(targets, WEATHER_CONCURRENCY, async (token) => {
+      const user = users[token];
+      if (!user) return;
+
+      try {
+        const weather = await fetchWeather(user.latitude, user.longitude);
+        const alerts = evaluateRisk(weather);
+        const severeAlerts = alerts.filter(severeOrDanger);
+        const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
+        const previousActiveTypes = Array.isArray(user.activeAlertTypes)
+          ? [...user.activeAlertTypes].sort()
+          : [];
+
+        const newlyTriggered = severeAlerts.filter(
+          (alert) => !previousActiveTypes.includes(alert.type),
+        );
+
+        if (newlyTriggered.length > 0) {
+          const topAlert = newlyTriggered[0];
+          const title =
+            topAlert.severity === "danger"
+              ? "🚨 Dangerous Condition"
+              : "⚠️ Severe Condition";
+
+          const pushed = await sendPush(token, title, topAlert.message, {
+            type: topAlert.type,
+            severity: topAlert.severity,
+          });
+
+          if (pushed.deviceNotRegistered) {
+            delete users[token];
+            changed = true;
+            console.log(`Removed unregistered token ${maskToken(token)}`);
+            return;
+          }
+
+          if (!pushed.ok) {
+            console.warn(`Push failed for ${maskToken(token)}: ${pushed.reason}`);
+          } else {
+            console.log(`Pushed ${topAlert.type} to ${maskToken(token)}`);
+          }
+        }
+
+        const hasTypeChange =
+          JSON.stringify(previousActiveTypes) !== JSON.stringify(nextActiveTypes);
+        if (hasTypeChange || user.lastRiskCheckAt == null) {
+          users[token] = {
+            ...user,
+            activeAlertTypes: nextActiveTypes,
+            lastRiskCheckAt: nowIso(),
+          };
+          changed = true;
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`Risk check failed for ${maskToken(token)}: ${msg}`);
+      }
+    });
+
+    return changed;
+  });
 
   console.log(
-    `Risk check complete: total=${tokens.length}, checked=${targets.length}, ms=${Date.now() - started}`,
+    `Risk check complete: total=${totalUsers}, checked=${checkedUsers}, ms=${Date.now() - started}`,
   );
-  runtimeStats.riskChecksLastCheckedUsers = targets.length;
+  runtimeStats.riskChecksLastCheckedUsers = checkedUsers;
   runtimeStats.riskChecksLastMs = Date.now() - started;
 }
 
@@ -884,11 +888,22 @@ cron.schedule("30 2 * * *", () => {
 
 if (process.env.ENABLE_SELF_PING === "true") {
   cron.schedule("*/14 * * * *", () => {
-    fetch(`${SERVER_URL}/health`).catch(() => {});
+    fetch(`${SERVER_URL}/health`).catch(() => { });
   });
 }
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log("Cron: risk=every 5 min, summary=06:00 UTC, prune=02:30 UTC");
+
+  // Startup validations
+  if (!process.env.WEATHER_API_KEY) {
+    console.warn("⚠️  WARNING: WEATHER_API_KEY is not set. All weather fetches will fail.");
+  }
+  if (!CLIENT_API_KEY) {
+    console.warn("⚠️  WARNING: CLIENT_API_KEY is not set. Write endpoints (/register, /update-location) are UNPROTECTED.");
+  }
+  if (!process.env.CRON_SECRET) {
+    console.warn("⚠️  WARNING: CRON_SECRET is not set. Cron/admin endpoints (/check, /users, /stats) will always return 401.");
+  }
 });
