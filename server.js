@@ -34,6 +34,16 @@ const LOCATION_UPDATE_MIN_INTERVAL_MS = Number(
 const LOCATION_JITTER_THRESHOLD = Number(
   process.env.LOCATION_JITTER_THRESHOLD || 0.0001,
 );
+const CLIENT_API_KEY = process.env.CLIENT_API_KEY || "";
+const RATE_LIMIT_WINDOW_MS = Number(
+  process.env.RATE_LIMIT_WINDOW_MS || 60 * 1000,
+);
+const RATE_LIMIT_MAX_WRITES_PER_IP = Number(
+  process.env.RATE_LIMIT_MAX_WRITES_PER_IP || 120,
+);
+const RATE_LIMIT_MAX_WRITES_PER_TOKEN = Number(
+  process.env.RATE_LIMIT_MAX_WRITES_PER_TOKEN || 60,
+);
 
 const RISK_LIMITS = {
   PM25_WARNING: 12,
@@ -68,6 +78,8 @@ const runtimeStats = {
 };
 
 const weatherCache = new Map();
+const writeIpBuckets = new Map();
+const writeTokenBuckets = new Map();
 
 const maskToken = (token) => {
   if (!token || token.length < 10) return "[invalid-token]";
@@ -148,6 +160,78 @@ function isAuthorizedCronRequest(req) {
   const configured = process.env.CRON_SECRET;
   if (!configured) return false;
   return getCronSecret(req) === configured;
+}
+
+function isAuthorizedClientWriteRequest(req) {
+  if (!CLIENT_API_KEY) return true;
+  const headerKey = req.headers["x-client-key"];
+  return typeof headerKey === "string" && headerKey === CLIENT_API_KEY;
+}
+
+function getRequestIp(req) {
+  const forwarded = req.headers["x-forwarded-for"];
+  if (typeof forwarded === "string" && forwarded.length > 0) {
+    return forwarded.split(",")[0].trim();
+  }
+  return req.ip || "unknown";
+}
+
+function cleanupRateLimitBuckets(store, nowMs) {
+  for (const [key, bucket] of store.entries()) {
+    if (nowMs - bucket.windowStartMs >= RATE_LIMIT_WINDOW_MS) {
+      store.delete(key);
+    }
+  }
+}
+
+function consumeRateLimit(store, key, limit, nowMs) {
+  const existing = store.get(key);
+  if (!existing || nowMs - existing.windowStartMs >= RATE_LIMIT_WINDOW_MS) {
+    store.set(key, { windowStartMs: nowMs, count: 1 });
+    return true;
+  }
+  if (existing.count >= limit) {
+    return false;
+  }
+  existing.count += 1;
+  return true;
+}
+
+function enforceWriteGuards(req, res, next) {
+  if (!isAuthorizedClientWriteRequest(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const nowMs = Date.now();
+  cleanupRateLimitBuckets(writeIpBuckets, nowMs);
+  cleanupRateLimitBuckets(writeTokenBuckets, nowMs);
+
+  const ipKey = getRequestIp(req);
+  if (
+    !consumeRateLimit(
+      writeIpBuckets,
+      ipKey,
+      RATE_LIMIT_MAX_WRITES_PER_IP,
+      nowMs,
+    )
+  ) {
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
+  const tokenKey = req.body?.fcmToken;
+  if (
+    typeof tokenKey === "string" &&
+    !consumeRateLimit(
+      writeTokenBuckets,
+      tokenKey,
+      RATE_LIMIT_MAX_WRITES_PER_TOKEN,
+      nowMs,
+    )
+  ) {
+    return res.status(429).json({ error: "Too many requests" });
+  }
+
+  return next();
 }
 
 function evaluateRisk(weatherData) {
@@ -605,7 +689,7 @@ app.get("/health", (_req, res) => {
   });
 });
 
-app.post("/register", async (req, res) => {
+app.post("/register", enforceWriteGuards, async (req, res) => {
   runtimeStats.registerRequests += 1;
   const { fcmToken, latitude, longitude } = req.body || {};
 
@@ -641,7 +725,7 @@ app.post("/register", async (req, res) => {
   return res.json({ success: true });
 });
 
-app.post("/update-location", async (req, res) => {
+app.post("/update-location", enforceWriteGuards, async (req, res) => {
   runtimeStats.updateLocationRequests += 1;
   const { fcmToken, latitude, longitude, appOpen } = req.body || {};
 
