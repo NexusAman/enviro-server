@@ -136,13 +136,15 @@ async function saveAllUsers(users) {
 }
 
 async function withUsersWriteLock(mutator) {
-  usersWriteQueue = usersWriteQueue.catch(() => { }).then(async () => {
-    const users = await getAllUsers();
-    const changed = await mutator(users);
-    if (changed) {
-      await saveAllUsers(users);
-    }
-  });
+  usersWriteQueue = usersWriteQueue
+    .catch(() => {})
+    .then(async () => {
+      const users = await getAllUsers();
+      const changed = await mutator(users);
+      if (changed) {
+        await saveAllUsers(users);
+      }
+    });
   return usersWriteQueue;
 }
 
@@ -434,6 +436,7 @@ async function sendPush(token, title, body, data = {}) {
             body,
             data,
             sound: "default",
+            channelId: "default", // 👈 Ensure Android uses your custom channel
           }),
         },
         FETCH_TIMEOUT_MS,
@@ -520,7 +523,8 @@ async function runRiskCheck() {
     const targets = tokens.filter((token) => {
       const user = users[token];
       if (!user) return false;
-      if (!isValidLat(user.latitude) || !isValidLon(user.longitude)) return false;
+      if (!isValidLat(user.latitude) || !isValidLon(user.longitude))
+        return false;
       return !isUserAppOpen(user);
     });
     checkedUsers = targets.length;
@@ -552,6 +556,8 @@ async function runRiskCheck() {
           const pushed = await sendPush(token, title, topAlert.message, {
             type: topAlert.type,
             severity: topAlert.severity,
+            message: topAlert.message, // 👈 Required for app sync
+            source: "server_alert", // 👈 Identifies sync data
           });
 
           if (pushed.deviceNotRegistered) {
@@ -562,14 +568,17 @@ async function runRiskCheck() {
           }
 
           if (!pushed.ok) {
-            console.warn(`Push failed for ${maskToken(token)}: ${pushed.reason}`);
+            console.warn(
+              `Push failed for ${maskToken(token)}: ${pushed.reason}`,
+            );
           } else {
             console.log(`Pushed ${topAlert.type} to ${maskToken(token)}`);
           }
         }
 
         const hasTypeChange =
-          JSON.stringify(previousActiveTypes) !== JSON.stringify(nextActiveTypes);
+          JSON.stringify(previousActiveTypes) !==
+          JSON.stringify(nextActiveTypes);
         if (hasTypeChange || user.lastRiskCheckAt == null) {
           users[token] = {
             ...user,
@@ -731,7 +740,8 @@ app.post("/register", enforceWriteGuards, async (req, res) => {
 
 app.post("/update-location", enforceWriteGuards, async (req, res) => {
   runtimeStats.updateLocationRequests += 1;
-  const { fcmToken, latitude, longitude, appOpen } = req.body || {};
+  const { fcmToken, latitude, longitude, appOpen, activeAlertTypes } =
+    req.body || {}; // 👈 Accept activeAlertTypes
 
   if (
     !isValidExpoToken(fcmToken) ||
@@ -767,7 +777,14 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
         longitude,
       );
 
-      if (recentlyUpdated && sameAppState && sameLocation) {
+      // If nothing has changed, skip write to save Redis quota
+      if (
+        recentlyUpdated &&
+        sameAppState &&
+        sameLocation &&
+        JSON.stringify(existing.activeAlertTypes) ===
+          JSON.stringify(activeAlertTypes)
+      ) {
         skipped = true;
         runtimeStats.updateLocationSkipped += 1;
         return false;
@@ -780,9 +797,9 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
       latitude,
       longitude,
       appOpen: nextAppOpen,
-      activeAlertTypes: Array.isArray(existing.activeAlertTypes)
-        ? existing.activeAlertTypes
-        : [],
+      activeAlertTypes: Array.isArray(activeAlertTypes)
+        ? activeAlertTypes
+        : existing.activeAlertTypes || [], // 👈 Store the alerts handled by app
       lastSeen: nowIso(),
     };
     runtimeStats.updateLocationApplied += 1;
@@ -888,7 +905,7 @@ cron.schedule("0 22 * * *", () => {
 
 if (process.env.ENABLE_SELF_PING === "true") {
   cron.schedule("*/14 * * * *", () => {
-    fetch(`${SERVER_URL}/health`).catch(() => { });
+    fetch(`${SERVER_URL}/health`).catch(() => {});
   });
 }
 
@@ -898,12 +915,19 @@ app.listen(PORT, () => {
 
   // Startup validations
   if (!process.env.WEATHER_API_KEY) {
-    console.warn("⚠️  WARNING: WEATHER_API_KEY is not set. All weather fetches will fail.");
+    console.warn(
+      "⚠️  WARNING: WEATHER_API_KEY is not set. All weather fetches will fail.",
+    );
   }
   if (!CLIENT_API_KEY) {
-    console.warn("⚠️  WARNING: CLIENT_API_KEY is not set. Write endpoints (/register, /update-location) are UNPROTECTED.");
+    console.warn(
+      "⚠️  WARNING: CLIENT_API_KEY is not set. Write endpoints (/register, /update-location) are UNPROTECTED.",
+    );
   }
   if (!process.env.CRON_SECRET) {
-    console.warn("⚠️  WARNING: CRON_SECRET is not set. Cron/admin endpoints (/check, /users, /stats) will always return 401.");
+    console.warn(
+      "⚠️  WARNING: CRON_SECRET is not set. Cron/admin endpoints (/check, /users, /stats) will always return 401.",
+    );
   }
 });
+
