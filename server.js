@@ -72,6 +72,16 @@ const RISK_LIMITS = {
   WIND_WARNING: 40,
   WIND_SEVERE: 60,
   WIND_DANGER: 80,
+
+  // Precipitation mm/hr (IMD Rainfall Classification)
+  PRECIP_WARNING: 2.5,
+  PRECIP_SEVERE: 7.5,
+  PRECIP_DANGER: 35.5,
+
+  // Humidity % (IMD / WHO)
+  HUMIDITY_WARNING: 75,
+  HUMIDITY_SEVERE: 85,
+  HUMIDITY_DANGER: 95,
 };
 
 let usersWriteQueue = Promise.resolve();
@@ -139,10 +149,12 @@ const pruneWeatherCache = () => {
 };
 
 const nowIso = () =>
-  new Date().toLocaleString("sv-SE", {
-    timeZone: "Asia/Kolkata",
-    hour12: false,
-  }).replace(" ", "T") + "+05:30";
+  new Date()
+    .toLocaleString("sv-SE", {
+      timeZone: "Asia/Kolkata",
+      hour12: false,
+    })
+    .replace(" ", "T") + "+05:30";
 
 async function getAllUsers() {
   const data = await redis.get(USERS_KEY);
@@ -307,10 +319,12 @@ function evaluateRisk(weatherData) {
   if (!c) return alerts;
 
   const aq = c.air_quality;
-  const uv = c.uv;
+  const uv = c.is_day === 0 ? null : c.uv;
   const temp = c.temp_c;
   const visibility = c.vis_km;
   const wind = c.wind_kph;
+  const humidity = c.humidity;
+  const precip = c.precip_mm;
 
   // ─── Overall AQI (NAQI) ───────────────────────────────────────────────
   if (aq) {
@@ -431,6 +445,52 @@ function evaluateRisk(weatherData) {
         type: "Wind_warning",
         severity: "warning",
         message: `💨 Strong winds — ${wind} km/h. Secure loose objects outdoors.`,
+      });
+    }
+  }
+
+  // ─── Humidity (IMD / WHO) ─────────────────────────────────────────────
+  if (humidity != null) {
+    if (humidity >= RISK_LIMITS.HUMIDITY_DANGER) {
+      alerts.push({
+        type: "Humidity_danger",
+        severity: "danger",
+        message: `💧 Oppressive humidity — ${humidity}%. Heat index critical, stay hydrated indoors.`,
+      });
+    } else if (humidity >= RISK_LIMITS.HUMIDITY_SEVERE) {
+      alerts.push({
+        type: "Humidity_severe",
+        severity: "severe",
+        message: `💧 Very muggy — ${humidity}% humidity. Limit physical exertion outdoors.`,
+      });
+    } else if (humidity >= RISK_LIMITS.HUMIDITY_WARNING) {
+      alerts.push({
+        type: "Humidity_warning",
+        severity: "warning",
+        message: `💧 High humidity — ${humidity}%. May feel uncomfortable, stay hydrated.`,
+      });
+    }
+  }
+
+  // ─── Precipitation (IMD Rainfall Classification) ──────────────────────
+  if (precip != null && precip > 0) {
+    if (precip >= RISK_LIMITS.PRECIP_DANGER) {
+      alerts.push({
+        type: "Precip_danger",
+        severity: "danger",
+        message: `🌧 Heavy rain — ${precip} mm/hr. Flash flood risk, avoid low-lying areas.`,
+      });
+    } else if (precip >= RISK_LIMITS.PRECIP_SEVERE) {
+      alerts.push({
+        type: "Precip_severe",
+        severity: "severe",
+        message: `🌧 Moderate rain — ${precip} mm/hr. Waterlogging possible, drive carefully.`,
+      });
+    } else if (precip >= RISK_LIMITS.PRECIP_WARNING) {
+      alerts.push({
+        type: "Precip_warning",
+        severity: "warning",
+        message: `🌦 Light rain — ${precip} mm/hr. Carry an umbrella.`,
       });
     }
   }
@@ -726,7 +786,7 @@ async function sendDailySummary() {
 
       const body = [
         aqi > 0 ? `🌫 AQI: ${aqi} (${aqiLabel})` : null,
-        c.uv != null ? `☀️ UV: ${c.uv}` : null,
+        c.is_day !== 0 && c.uv != null ? `☀️ UV: ${c.uv}` : null,
         c.temp_c != null ? `🌡 Temp: ${c.temp_c}°C` : null,
         c.condition?.text ? `🌤 ${c.condition.text}` : null,
       ]
@@ -1008,21 +1068,29 @@ cron.schedule("*/5 * * * *", () => {
   });
 });
 
-cron.schedule("0 6 * * *", () => {
-  // 06:00 IST — morning briefing
-  sendDailySummary().catch((err) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn("daily summary cron failed:", msg);
-  });
-}, { timezone: "Asia/Kolkata" });
+cron.schedule(
+  "0 6 * * *",
+  () => {
+    // 06:00 IST — morning briefing
+    sendDailySummary().catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("daily summary cron failed:", msg);
+    });
+  },
+  { timezone: "Asia/Kolkata" },
+);
 
-cron.schedule("30 3 * * *", () => {
-  // 03:30 IST — nightly prune
-  pruneStaleUsers().catch((err) => {
-    const msg = err instanceof Error ? err.message : String(err);
-    console.warn("prune cron failed:", msg);
-  });
-}, { timezone: "Asia/Kolkata" });
+cron.schedule(
+  "30 3 * * *",
+  () => {
+    // 03:30 IST — nightly prune
+    pruneStaleUsers().catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn("prune cron failed:", msg);
+    });
+  },
+  { timezone: "Asia/Kolkata" },
+);
 
 if (process.env.ENABLE_SELF_PING === "true") {
   cron.schedule("*/14 * * * *", () => {
