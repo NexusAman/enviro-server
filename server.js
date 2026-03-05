@@ -16,7 +16,7 @@ const SERVER_URL =
   process.env.SERVER_URL || "https://enviro-server.onrender.com";
 
 const APP_OPEN_TTL_MS = Number(process.env.APP_OPEN_TTL_MS || 5 * 60 * 1000);
-const STALE_USER_PRUNE_DAYS = Number(process.env.STALE_USER_PRUNE_DAYS || 14);
+const STALE_USER_PRUNE_DAYS = Number(process.env.STALE_USER_PRUNE_DAYS || 21);
 const WEATHER_CONCURRENCY = Number(process.env.WEATHER_CONCURRENCY || 3);
 const FETCH_TIMEOUT_MS = Number(process.env.FETCH_TIMEOUT_MS || 12000);
 const WEATHER_CACHE_TTL_MS = Number(
@@ -45,18 +45,33 @@ const RATE_LIMIT_MAX_WRITES_PER_TOKEN = Number(
   process.env.RATE_LIMIT_MAX_WRITES_PER_TOKEN || 60,
 );
 
+// ─── Thresholds aligned with Indian Standards (CPCB / IMD) ──────────────────
 const RISK_LIMITS = {
-  PM25_WARNING: 12,
-  PM25_SEVERE: 35,
-  PM25_DANGER: 55,
+  // Overall AQI (NAQI / CPCB)
+  AQI_LIGHT_WARNING: 100, // Satisfactory → Moderate
+  AQI_WARNING: 200, // Moderate → Poor
+  AQI_SEVERE: 300, // Poor → Very Poor
+  AQI_DANGER: 400, // Very Poor → Severe
+
+  // UV Index (IMD / WHO)
   UV_WARNING: 3,
-  UV_DANGER: 6,
-  TEMP_WARNING: 35,
-  TEMP_DANGER: 40,
-  VISIBILITY_WARNING: 5,
-  VISIBILITY_DANGER: 2,
+  UV_SEVERE: 6,
+  UV_DANGER: 8,
+
+  // Temperature °C (IMD Heatwave)
+  TEMP_WARNING: 36,
+  TEMP_SEVERE: 40,
+  TEMP_DANGER: 45,
+
+  // Visibility km (IMD Fog Classification)
+  VISIBILITY_WARNING: 3,
+  VISIBILITY_SEVERE: 1,
+  VISIBILITY_DANGER: 0.2,
+
+  // Wind km/h (IMD Wind Severity)
   WIND_WARNING: 40,
-  WIND_DANGER: 70,
+  WIND_SEVERE: 60,
+  WIND_DANGER: 80,
 };
 
 let usersWriteQueue = Promise.resolve();
@@ -123,7 +138,11 @@ const pruneWeatherCache = () => {
   }
 };
 
-const nowIso = () => new Date().toISOString();
+const nowIso = () =>
+  new Date().toLocaleString("sv-SE", {
+    timeZone: "Asia/Kolkata",
+    hour12: false,
+  }).replace(" ", "T") + "+05:30";
 
 async function getAllUsers() {
   const data = await redis.get(USERS_KEY);
@@ -236,47 +255,109 @@ function enforceWriteGuards(req, res, next) {
   return next();
 }
 
+// ─── NAQI Calculation (CPCB India — PM2.5 + PM10 only) ──────────────────────
+// Gas pollutants (O3, CO, SO2, NO2) are excluded intentionally:
+// WeatherAPI provides real-time instant values but CPCB standards require
+// 8-hour / 24-hour rolling averages for gases. Using real-time gas spikes
+// artificially inflates AQI vs official monitor readings.
+
+function interpolate(c, cLow, cHigh, iLow, iHigh) {
+  return Math.round(((iHigh - iLow) / (cHigh - cLow)) * (c - cLow) + iLow);
+}
+
+function calcPM25(pm25) {
+  if (pm25 == null) return 0;
+  if (pm25 <= 30) return interpolate(pm25, 0, 30, 0, 50);
+  if (pm25 <= 60) return interpolate(pm25, 31, 60, 51, 100);
+  if (pm25 <= 90) return interpolate(pm25, 61, 90, 101, 200);
+  if (pm25 <= 120) return interpolate(pm25, 91, 120, 201, 300);
+  if (pm25 <= 250) return interpolate(pm25, 121, 250, 301, 400);
+  return interpolate(Math.min(pm25, 500), 251, 500, 401, 500);
+}
+
+function calcPM10(pm10) {
+  if (pm10 == null) return 0;
+  if (pm10 <= 50) return interpolate(pm10, 0, 50, 0, 50);
+  if (pm10 <= 100) return interpolate(pm10, 51, 100, 51, 100);
+  if (pm10 <= 250) return interpolate(pm10, 101, 250, 101, 200);
+  if (pm10 <= 350) return interpolate(pm10, 251, 350, 201, 300);
+  if (pm10 <= 430) return interpolate(pm10, 351, 430, 301, 400);
+  return interpolate(Math.min(pm10, 600), 431, 600, 401, 500);
+}
+
+function calculateOverallAQI(aq) {
+  if (!aq) return 0;
+  return Math.max(calcPM25(aq.pm2_5), calcPM10(aq.pm10));
+}
+
+function getAQILabel(aqi) {
+  if (aqi <= 50) return "GOOD";
+  if (aqi <= 100) return "SATISFACTORY";
+  if (aqi <= 200) return "MODERATE";
+  if (aqi <= 300) return "POOR";
+  if (aqi <= 400) return "VERY POOR";
+  return "SEVERE";
+}
+
+// ─── Risk Evaluation (3-tier: warning / severe / danger) ────────────────────
+
 function evaluateRisk(weatherData) {
   const alerts = [];
   const c = weatherData?.current;
   if (!c) return alerts;
 
-  const pm25 = c.air_quality?.pm2_5;
+  const aq = c.air_quality;
   const uv = c.uv;
   const temp = c.temp_c;
   const visibility = c.vis_km;
   const wind = c.wind_kph;
 
-  if (pm25 != null) {
-    if (pm25 > RISK_LIMITS.PM25_DANGER) {
+  // ─── Overall AQI (NAQI) ───────────────────────────────────────────────
+  if (aq) {
+    const aqi = calculateOverallAQI(aq);
+
+    if (aqi >= RISK_LIMITS.AQI_DANGER) {
       alerts.push({
-        type: "AirQuality_danger",
+        type: "AQI_danger",
         severity: "danger",
-        message: `🫁 Hazardous air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Stay indoors.`,
+        message: `☠️ Severe air quality — AQI ${aqi}. Serious health impact, stay indoors.`,
       });
-    } else if (pm25 > RISK_LIMITS.PM25_SEVERE) {
+    } else if (aqi >= RISK_LIMITS.AQI_SEVERE) {
       alerts.push({
-        type: "AirQuality_severe",
+        type: "AQI_severe",
         severity: "severe",
-        message: `😷 Unhealthy air — PM2.5 at ${pm25.toFixed(1)} µg/m³. Wear a mask outdoors.`,
+        message: `🚨 Very poor air — AQI ${aqi}. Respiratory illness risk, avoid outdoors.`,
       });
-    } else if (pm25 > RISK_LIMITS.PM25_WARNING) {
+    } else if (aqi >= RISK_LIMITS.AQI_WARNING) {
       alerts.push({
-        type: "AirQuality_warning",
+        type: "AQI_warning",
         severity: "warning",
-        message: `⚠️ Air quality declining — PM2.5 at ${pm25.toFixed(1)} µg/m³.`,
+        message: `⚠️ Poor air quality — AQI ${aqi}. Health discomfort possible.`,
+      });
+    } else if (aqi >= RISK_LIMITS.AQI_LIGHT_WARNING) {
+      alerts.push({
+        type: "AQI_light_warning",
+        severity: "warning",
+        message: `💨 Moderate air — AQI ${aqi}. Sensitive groups should take caution.`,
       });
     }
   }
 
+  // ─── UV Index (IMD / WHO) ─────────────────────────────────────────────
   if (uv != null) {
-    if (uv > RISK_LIMITS.UV_DANGER) {
+    if (uv >= RISK_LIMITS.UV_DANGER) {
       alerts.push({
         type: "UV_danger",
         severity: "danger",
-        message: `☀️ Extreme UV index (${uv}). Avoid direct sun, use SPF 50+.`,
+        message: `☀️ Extreme UV index (${uv}). Avoid sun exposure, use SPF 50+.`,
       });
-    } else if (uv > RISK_LIMITS.UV_WARNING) {
+    } else if (uv >= RISK_LIMITS.UV_SEVERE) {
+      alerts.push({
+        type: "UV_severe",
+        severity: "severe",
+        message: `☀️ Very high UV index (${uv}). Limit midday sun, wear protective clothing.`,
+      });
+    } else if (uv >= RISK_LIMITS.UV_WARNING) {
       alerts.push({
         type: "UV_warning",
         severity: "warning",
@@ -285,30 +366,44 @@ function evaluateRisk(weatherData) {
     }
   }
 
+  // ─── Temperature (IMD Heatwave) ───────────────────────────────────────
   if (temp != null) {
-    if (temp > RISK_LIMITS.TEMP_DANGER) {
+    if (temp >= RISK_LIMITS.TEMP_DANGER) {
       alerts.push({
         type: "Temp_danger",
         severity: "danger",
-        message: `🌡 Extreme heat — ${temp}°C. Risk of heatstroke. Stay indoors.`,
+        message: `🌡 Extreme heat — ${temp}°C. Life-threatening, stay indoors with cooling.`,
       });
-    } else if (temp > RISK_LIMITS.TEMP_WARNING) {
+    } else if (temp >= RISK_LIMITS.TEMP_SEVERE) {
+      alerts.push({
+        type: "Temp_severe",
+        severity: "severe",
+        message: `🌡 Severe heat — ${temp}°C. Risk of heatstroke, stay hydrated and indoors.`,
+      });
+    } else if (temp >= RISK_LIMITS.TEMP_WARNING) {
       alerts.push({
         type: "Temp_warning",
         severity: "warning",
-        message: `🌡 High temperature — ${temp}°C. Stay hydrated.`,
+        message: `🌡 High temperature — ${temp}°C. Stay hydrated and limit exertion.`,
       });
     }
   }
 
+  // ─── Visibility (IMD Fog Classification) ──────────────────────────────
   if (visibility != null) {
-    if (visibility < RISK_LIMITS.VISIBILITY_DANGER) {
+    if (visibility <= RISK_LIMITS.VISIBILITY_DANGER) {
       alerts.push({
         type: "Visibility_danger",
         severity: "danger",
-        message: `🌫 Very poor visibility — ${visibility} km. Avoid driving.`,
+        message: `🌫 Dense fog — ${visibility} km visibility. Do not drive.`,
       });
-    } else if (visibility < RISK_LIMITS.VISIBILITY_WARNING) {
+    } else if (visibility <= RISK_LIMITS.VISIBILITY_SEVERE) {
+      alerts.push({
+        type: "Visibility_severe",
+        severity: "severe",
+        message: `🌫 Very poor visibility — ${visibility} km. Avoid driving if possible.`,
+      });
+    } else if (visibility <= RISK_LIMITS.VISIBILITY_WARNING) {
       alerts.push({
         type: "Visibility_warning",
         severity: "warning",
@@ -317,18 +412,25 @@ function evaluateRisk(weatherData) {
     }
   }
 
+  // ─── Wind Speed (IMD Wind Severity) ───────────────────────────────────
   if (wind != null) {
-    if (wind > RISK_LIMITS.WIND_DANGER) {
+    if (wind >= RISK_LIMITS.WIND_DANGER) {
       alerts.push({
         type: "Wind_danger",
         severity: "danger",
+        message: `💨 Cyclonic winds — ${wind} km/h. Stay indoors, avoid all outdoor activity.`,
+      });
+    } else if (wind >= RISK_LIMITS.WIND_SEVERE) {
+      alerts.push({
+        type: "Wind_severe",
+        severity: "severe",
         message: `💨 Storm-level winds — ${wind} km/h. Avoid outdoor activity.`,
       });
-    } else if (wind > RISK_LIMITS.WIND_WARNING) {
+    } else if (wind >= RISK_LIMITS.WIND_WARNING) {
       alerts.push({
         type: "Wind_warning",
         severity: "warning",
-        message: `💨 Strong winds — ${wind} km/h. Secure loose objects.`,
+        message: `💨 Strong winds — ${wind} km/h. Secure loose objects outdoors.`,
       });
     }
   }
@@ -336,22 +438,7 @@ function evaluateRisk(weatherData) {
   return alerts;
 }
 
-function calculateAQI(pm25) {
-  if (pm25 <= 12) return Math.round((50 / 12) * pm25);
-  if (pm25 <= 35.4) {
-    return Math.round(((100 - 51) / (35.4 - 12.1)) * (pm25 - 12.1) + 51);
-  }
-  if (pm25 <= 55.4) {
-    return Math.round(((150 - 101) / (55.4 - 35.5)) * (pm25 - 35.5) + 101);
-  }
-  if (pm25 <= 150.4) {
-    return Math.round(((200 - 151) / (150.4 - 55.5)) * (pm25 - 55.5) + 151);
-  }
-  if (pm25 <= 250.4) {
-    return Math.round(((300 - 201) / (250.4 - 150.5)) * (pm25 - 150.5) + 201);
-  }
-  return Math.round(((500 - 301) / (500.4 - 250.5)) * (pm25 - 250.5) + 301);
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function isUserAppOpen(user) {
   if (!user?.appOpen) return false;
@@ -436,7 +523,7 @@ async function sendPush(token, title, body, data = {}) {
             body,
             data,
             sound: "default",
-            channelId: "default", // 👈 Ensure Android uses your custom channel
+            channelId: "default",
           }),
         },
         FETCH_TIMEOUT_MS,
@@ -502,6 +589,8 @@ async function mapWithConcurrency(items, limit, worker) {
   await Promise.all(active);
 }
 
+// ─── Jobs ─────────────────────────────────────────────────────────────────────
+
 async function runRiskCheck() {
   const started = Date.now();
   runtimeStats.riskChecksRun += 1;
@@ -556,8 +645,8 @@ async function runRiskCheck() {
           const pushed = await sendPush(token, title, topAlert.message, {
             type: topAlert.type,
             severity: topAlert.severity,
-            message: topAlert.message, // 👈 Required for app sync
-            source: "server_alert", // 👈 Identifies sync data
+            message: topAlert.message,
+            source: "server_alert",
           });
 
           if (pushed.deviceNotRegistered) {
@@ -603,18 +692,26 @@ async function runRiskCheck() {
   runtimeStats.riskChecksLastMs = Date.now() - started;
 }
 
+// FIX: sendDailySummary previously called getAllUsers / saveAllUsers directly,
+// bypassing withUsersWriteLock. Concurrent /register or /update-location writes
+// in Redis could be clobbered when saveAllUsers ran. Now weather fetches run
+// outside the lock (they're slow), then token deletions are committed via the
+// lock in a single batch at the end.
 async function sendDailySummary() {
   const started = Date.now();
   runtimeStats.dailySummariesRun += 1;
   console.log(`[${nowIso()}] Sending daily summary...`);
 
+  // Read a snapshot for iteration — weather fetches happen outside the lock
   const users = await getAllUsers();
   const tokens = Object.keys(users).filter((token) => {
     const u = users[token];
     return u && isValidLat(u.latitude) && isValidLon(u.longitude);
   });
 
-  let changed = false;
+  // Collect unregistered tokens; mutations are applied after all fetches finish
+  const tokensToRemove = [];
+
   await mapWithConcurrency(tokens, WEATHER_CONCURRENCY, async (token) => {
     const user = users[token];
     if (!user) return;
@@ -624,11 +721,11 @@ async function sendDailySummary() {
       const c = weather?.current;
       if (!c) return;
 
-      const pm25 = c.air_quality?.pm2_5;
-      const aqiRaw = pm25 != null ? calculateAQI(pm25) : null;
+      const aqi = calculateOverallAQI(c.air_quality);
+      const aqiLabel = getAQILabel(aqi);
 
       const body = [
-        aqiRaw != null ? `🌫 AQI: ${aqiRaw}` : null,
+        aqi > 0 ? `🌫 AQI: ${aqi} (${aqiLabel})` : null,
         c.uv != null ? `☀️ UV: ${c.uv}` : null,
         c.temp_c != null ? `🌡 Temp: ${c.temp_c}°C` : null,
         c.condition?.text ? `🌤 ${c.condition.text}` : null,
@@ -641,12 +738,13 @@ async function sendDailySummary() {
         "🌿 Good Morning — Today's Air Report",
         body,
       );
+
       if (pushed.deviceNotRegistered) {
-        delete users[token];
-        changed = true;
-        console.log(`Removed unregistered token ${maskToken(token)}`);
+        tokensToRemove.push(token);
+        console.log(`Removing unregistered token ${maskToken(token)}`);
         return;
       }
+
       if (!pushed.ok) {
         console.warn(
           `Daily summary push failed for ${maskToken(token)}: ${pushed.reason}`,
@@ -658,8 +756,14 @@ async function sendDailySummary() {
     }
   });
 
-  if (changed) {
-    await saveAllUsers(users);
+  // Apply deletions atomically through the write lock
+  if (tokensToRemove.length > 0) {
+    await withUsersWriteLock(async (latestUsers) => {
+      for (const token of tokensToRemove) {
+        delete latestUsers[token];
+      }
+      return true;
+    });
   }
 
   console.log(
@@ -668,31 +772,38 @@ async function sendDailySummary() {
   runtimeStats.dailySummariesLastMs = Date.now() - started;
 }
 
+// FIX: pruneStaleUsers previously read/mutated/saved outside withUsersWriteLock,
+// creating the same write-race as sendDailySummary. Now runs fully inside the lock.
 async function pruneStaleUsers() {
   runtimeStats.prunesRun += 1;
-  const users = await getAllUsers();
-  const tokens = Object.keys(users);
-  if (tokens.length === 0) return;
-
-  const cutoffMs = Date.now() - STALE_USER_PRUNE_DAYS * 24 * 60 * 60 * 1000;
   let removed = 0;
 
-  for (const token of tokens) {
-    const user = users[token];
-    const seenMs = Date.parse(user?.lastSeen || "");
-    if (!Number.isFinite(seenMs) || seenMs < cutoffMs) {
-      delete users[token];
-      removed += 1;
-    }
-  }
+  await withUsersWriteLock(async (users) => {
+    const tokens = Object.keys(users);
+    if (tokens.length === 0) return false;
 
-  if (removed > 0) {
-    await saveAllUsers(users);
-    console.log(`Pruned ${removed} stale users`);
-  }
+    const cutoffMs = Date.now() - STALE_USER_PRUNE_DAYS * 24 * 60 * 60 * 1000;
+
+    for (const token of tokens) {
+      const user = users[token];
+      const seenMs = Date.parse(user?.lastSeen || "");
+      if (!Number.isFinite(seenMs) || seenMs < cutoffMs) {
+        delete users[token];
+        removed += 1;
+      }
+    }
+
+    if (removed > 0) {
+      console.log(`Pruned ${removed} stale users`);
+    }
+
+    return removed > 0;
+  });
 
   runtimeStats.prunesLastRemoved = removed;
 }
+
+// ─── Routes ───────────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
   res.json({
@@ -741,7 +852,7 @@ app.post("/register", enforceWriteGuards, async (req, res) => {
 app.post("/update-location", enforceWriteGuards, async (req, res) => {
   runtimeStats.updateLocationRequests += 1;
   const { fcmToken, latitude, longitude, appOpen, activeAlertTypes } =
-    req.body || {}; // 👈 Accept activeAlertTypes
+    req.body || {};
 
   if (
     !isValidExpoToken(fcmToken) ||
@@ -777,7 +888,6 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
         longitude,
       );
 
-      // If nothing has changed, skip write to save Redis quota
       if (
         recentlyUpdated &&
         sameAppState &&
@@ -799,7 +909,7 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
       appOpen: nextAppOpen,
       activeAlertTypes: Array.isArray(activeAlertTypes)
         ? activeAlertTypes
-        : existing.activeAlertTypes || [], // 👈 Store the alerts handled by app
+        : existing.activeAlertTypes || [],
       lastSeen: nowIso(),
     };
     runtimeStats.updateLocationApplied += 1;
@@ -813,8 +923,15 @@ app.get("/check", async (req, res) => {
   if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-
   await runRiskCheck();
+  return res.json({ success: true });
+});
+
+app.get("/daily-summary", async (req, res) => {
+  if (!isAuthorizedCronRequest(req)) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+  await sendDailySummary();
   return res.json({ success: true });
 });
 
@@ -882,6 +999,8 @@ app.get("/stats", async (req, res) => {
   });
 });
 
+// ─── Cron ─────────────────────────────────────────────────────────────────────
+
 cron.schedule("*/5 * * * *", () => {
   runRiskCheck().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
@@ -889,19 +1008,21 @@ cron.schedule("*/5 * * * *", () => {
   });
 });
 
-cron.schedule("30 0 * * *", () => {
+cron.schedule("0 6 * * *", () => {
+  // 06:00 IST — morning briefing
   sendDailySummary().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("daily summary cron failed:", msg);
   });
-});
+}, { timezone: "Asia/Kolkata" });
 
-cron.schedule("0 22 * * *", () => {
+cron.schedule("30 3 * * *", () => {
+  // 03:30 IST — nightly prune
   pruneStaleUsers().catch((err) => {
     const msg = err instanceof Error ? err.message : String(err);
     console.warn("prune cron failed:", msg);
   });
-});
+}, { timezone: "Asia/Kolkata" });
 
 if (process.env.ENABLE_SELF_PING === "true") {
   cron.schedule("*/14 * * * *", () => {
@@ -911,9 +1032,8 @@ if (process.env.ENABLE_SELF_PING === "true") {
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log("Cron: risk=every 5 min, summary=06:00 UTC, prune=02:30 UTC");
+  console.log("Cron (IST): risk=every 5 min, summary=06:00, prune=03:30");
 
-  // Startup validations
   if (!process.env.WEATHER_API_KEY) {
     console.warn(
       "⚠️  WARNING: WEATHER_API_KEY is not set. All weather fetches will fail.",
@@ -921,13 +1041,12 @@ app.listen(PORT, () => {
   }
   if (!CLIENT_API_KEY) {
     console.warn(
-      "⚠️  WARNING: CLIENT_API_KEY is not set. Write endpoints (/register, /update-location) are UNPROTECTED.",
+      "⚠️  WARNING: CLIENT_API_KEY is not set. Write endpoints are UNPROTECTED.",
     );
   }
   if (!process.env.CRON_SECRET) {
     console.warn(
-      "⚠️  WARNING: CRON_SECRET is not set. Cron/admin endpoints (/check, /users, /stats) will always return 401.",
+      "⚠️  WARNING: CRON_SECRET is not set. Cron/admin endpoints will always return 401.",
     );
   }
 });
-
