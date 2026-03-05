@@ -1,6 +1,6 @@
 {
   "name": "enviro-monitor-server",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "description": "Background alert server for Enviro Monitor app",
   "main": "server.js",
