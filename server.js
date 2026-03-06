@@ -148,13 +148,14 @@ const pruneWeatherCache = () => {
   }
 };
 
-const nowIso = () =>
-  new Date()
-    .toLocaleString("sv-SE", {
-      timeZone: "Asia/Kolkata",
-      hour12: false,
-    })
-    .replace(" ", "T") + "+05:30";
+const nowIso = () => {
+  const now = new Date();
+  // IST = UTC + 5:30 — manual offset avoids locale-dependent toLocaleString
+  const istMs = now.getTime() + (5 * 60 + 30) * 60 * 1000;
+  const ist = new Date(istMs);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${ist.getUTCFullYear()}-${pad(ist.getUTCMonth() + 1)}-${pad(ist.getUTCDate())}T${pad(ist.getUTCHours())}:${pad(ist.getUTCMinutes())}:${pad(ist.getUTCSeconds())}+05:30`;
+};
 
 async function getAllUsers() {
   const data = await redis.get(USERS_KEY);
@@ -280,21 +281,21 @@ function interpolate(c, cLow, cHigh, iLow, iHigh) {
 function calcPM25(pm25) {
   if (pm25 == null) return 0;
   if (pm25 <= 30) return interpolate(pm25, 0, 30, 0, 50);
-  if (pm25 <= 60) return interpolate(pm25, 31, 60, 51, 100);
-  if (pm25 <= 90) return interpolate(pm25, 61, 90, 101, 200);
-  if (pm25 <= 120) return interpolate(pm25, 91, 120, 201, 300);
-  if (pm25 <= 250) return interpolate(pm25, 121, 250, 301, 400);
-  return interpolate(Math.min(pm25, 500), 251, 500, 401, 500);
+  if (pm25 <= 60) return interpolate(pm25, 30.01, 60, 51, 100);
+  if (pm25 <= 90) return interpolate(pm25, 60.01, 90, 101, 200);
+  if (pm25 <= 120) return interpolate(pm25, 90.01, 120, 201, 300);
+  if (pm25 <= 250) return interpolate(pm25, 120.01, 250, 301, 400);
+  return interpolate(Math.min(pm25, 500), 250.01, 500, 401, 500);
 }
 
 function calcPM10(pm10) {
   if (pm10 == null) return 0;
   if (pm10 <= 50) return interpolate(pm10, 0, 50, 0, 50);
-  if (pm10 <= 100) return interpolate(pm10, 51, 100, 51, 100);
-  if (pm10 <= 250) return interpolate(pm10, 101, 250, 101, 200);
-  if (pm10 <= 350) return interpolate(pm10, 251, 350, 201, 300);
-  if (pm10 <= 430) return interpolate(pm10, 351, 430, 301, 400);
-  return interpolate(Math.min(pm10, 600), 431, 600, 401, 500);
+  if (pm10 <= 100) return interpolate(pm10, 50.01, 100, 51, 100);
+  if (pm10 <= 250) return interpolate(pm10, 100.01, 250, 101, 200);
+  if (pm10 <= 350) return interpolate(pm10, 250.01, 350, 201, 300);
+  if (pm10 <= 430) return interpolate(pm10, 350.01, 430, 301, 400);
+  return interpolate(Math.min(pm10, 600), 430.01, 600, 401, 500);
 }
 
 function calculateOverallAQI(aq) {
@@ -567,24 +568,27 @@ async function fetchWeather(lat, lon) {
   throw lastError || new Error("Weather fetch failed");
 }
 
-async function sendPush(token, title, body, data = {}) {
+async function sendPush(token, title, body, data = {}, color = undefined) {
   let lastError = null;
 
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      const payload = {
+        to: token,
+        title,
+        body,
+        data,
+        sound: "default",
+        channelId: "default",
+      };
+      if (color) payload.color = color;
+
       const res = await fetchWithTimeout(
         "https://exp.host/--/api/v2/push/send",
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            to: token,
-            title,
-            body,
-            data,
-            sound: "default",
-            channelId: "default",
-          }),
+          body: JSON.stringify(payload),
         },
         FETCH_TIMEOUT_MS,
       );
@@ -656,94 +660,115 @@ async function runRiskCheck() {
   runtimeStats.riskChecksRun += 1;
   console.log(`[${nowIso()}] Running risk check...`);
 
-  let totalUsers = 0;
-  let checkedUsers = 0;
+  // Read a snapshot — weather fetches happen outside the lock (they're slow)
+  const users = await getAllUsers();
+  const tokens = Object.keys(users);
+  const totalUsers = tokens.length;
 
-  await withUsersWriteLock(async (users) => {
-    const tokens = Object.keys(users);
-    totalUsers = tokens.length;
+  if (tokens.length === 0) {
+    console.log("No registered users.");
+    runtimeStats.riskChecksLastCheckedUsers = 0;
+    runtimeStats.riskChecksLastMs = Date.now() - started;
+    return;
+  }
 
-    if (tokens.length === 0) {
-      console.log("No registered users.");
-      return false;
-    }
+  const targets = tokens.filter((token) => {
+    const user = users[token];
+    if (!user) return false;
+    if (!isValidLat(user.latitude) || !isValidLon(user.longitude)) return false;
+    return !isUserAppOpen(user);
+  });
+  const checkedUsers = targets.length;
 
-    let changed = false;
-    const targets = tokens.filter((token) => {
-      const user = users[token];
-      if (!user) return false;
-      if (!isValidLat(user.latitude) || !isValidLon(user.longitude))
-        return false;
-      return !isUserAppOpen(user);
-    });
-    checkedUsers = targets.length;
+  // Collect mutations to apply after all fetches complete
+  const tokensToRemove = [];
+  const userUpdates = new Map();
 
-    await mapWithConcurrency(targets, WEATHER_CONCURRENCY, async (token) => {
-      const user = users[token];
-      if (!user) return;
+  await mapWithConcurrency(targets, WEATHER_CONCURRENCY, async (token) => {
+    const user = users[token];
+    if (!user) return;
 
-      try {
-        const weather = await fetchWeather(user.latitude, user.longitude);
-        const alerts = evaluateRisk(weather);
-        const severeAlerts = alerts.filter(severeOrDanger);
-        const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
-        const previousActiveTypes = Array.isArray(user.activeAlertTypes)
-          ? [...user.activeAlertTypes].sort()
-          : [];
+    try {
+      const weather = await fetchWeather(user.latitude, user.longitude);
+      const alerts = evaluateRisk(weather);
+      const severeAlerts = alerts.filter(severeOrDanger);
+      const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
+      const previousActiveTypes = Array.isArray(user.activeAlertTypes)
+        ? [...user.activeAlertTypes].sort()
+        : [];
 
-        const newlyTriggered = severeAlerts.filter(
-          (alert) => !previousActiveTypes.includes(alert.type),
+      const newlyTriggered = severeAlerts.filter(
+        (alert) => !previousActiveTypes.includes(alert.type),
+      );
+
+      // FIX: Push ALL newly triggered alerts, not just the first one
+      for (const alert of newlyTriggered) {
+        const title =
+          alert.severity === "danger"
+            ? "🚨 Dangerous Condition"
+            : "⚠️ Severe Condition";
+
+        const alertColor = alert.severity === "danger" ? "#E879F9" : "#F87171";
+
+        const pushed = await sendPush(
+          token,
+          title,
+          alert.message,
+          {
+            type: alert.type,
+            severity: alert.severity,
+            message: alert.message,
+            source: "server_alert",
+          },
+          alertColor,
         );
 
-        if (newlyTriggered.length > 0) {
-          const topAlert = newlyTriggered[0];
-          const title =
-            topAlert.severity === "danger"
-              ? "🚨 Dangerous Condition"
-              : "⚠️ Severe Condition";
-
-          const pushed = await sendPush(token, title, topAlert.message, {
-            type: topAlert.type,
-            severity: topAlert.severity,
-            message: topAlert.message,
-            source: "server_alert",
-          });
-
-          if (pushed.deviceNotRegistered) {
-            delete users[token];
-            changed = true;
-            console.log(`Removed unregistered token ${maskToken(token)}`);
-            return;
-          }
-
-          if (!pushed.ok) {
-            console.warn(
-              `Push failed for ${maskToken(token)}: ${pushed.reason}`,
-            );
-          } else {
-            console.log(`Pushed ${topAlert.type} to ${maskToken(token)}`);
-          }
+        if (pushed.deviceNotRegistered) {
+          tokensToRemove.push(token);
+          console.log(`Removed unregistered token ${maskToken(token)}`);
+          return; // skip remaining alerts for this token
         }
 
-        const hasTypeChange =
-          JSON.stringify(previousActiveTypes) !==
-          JSON.stringify(nextActiveTypes);
-        if (hasTypeChange || user.lastRiskCheckAt == null) {
-          users[token] = {
-            ...user,
-            activeAlertTypes: nextActiveTypes,
-            lastRiskCheckAt: nowIso(),
-          };
+        if (!pushed.ok) {
+          console.warn(`Push failed for ${maskToken(token)}: ${pushed.reason}`);
+        } else {
+          console.log(`Pushed ${alert.type} to ${maskToken(token)}`);
+        }
+      }
+
+      const hasTypeChange =
+        JSON.stringify(previousActiveTypes) !== JSON.stringify(nextActiveTypes);
+      if (hasTypeChange || user.lastRiskCheckAt == null) {
+        userUpdates.set(token, {
+          activeAlertTypes: nextActiveTypes,
+          lastRiskCheckAt: nowIso(),
+        });
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Risk check failed for ${maskToken(token)}: ${msg}`);
+    }
+  });
+
+  // Apply mutations atomically through the write lock
+  if (tokensToRemove.length > 0 || userUpdates.size > 0) {
+    await withUsersWriteLock(async (latestUsers) => {
+      let changed = false;
+      for (const token of tokensToRemove) {
+        if (latestUsers[token]) {
+          delete latestUsers[token];
           changed = true;
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`Risk check failed for ${maskToken(token)}: ${msg}`);
       }
+      for (const [token, update] of userUpdates) {
+        if (latestUsers[token]) {
+          latestUsers[token] = { ...latestUsers[token], ...update };
+          changed = true;
+        }
+      }
+      return changed;
     });
-
-    return changed;
-  });
+  }
 
   console.log(
     `Risk check complete: total=${totalUsers}, checked=${checkedUsers}, ms=${Date.now() - started}`,
@@ -797,6 +822,8 @@ async function sendDailySummary() {
         token,
         "🌿 Good Morning — Today's Air Report",
         body,
+        {},
+        "#34D399",
       );
 
       if (pushed.deviceNotRegistered) {
@@ -874,190 +901,282 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/register", enforceWriteGuards, async (req, res) => {
-  runtimeStats.registerRequests += 1;
-  const { fcmToken, latitude, longitude } = req.body || {};
+  try {
+    runtimeStats.registerRequests += 1;
+    const { fcmToken, latitude, longitude, deviceId, previousToken } =
+      req.body || {};
 
-  if (
-    !isValidExpoToken(fcmToken) ||
-    !isValidLat(latitude) ||
-    !isValidLon(longitude)
-  ) {
-    return res.status(400).json({
-      error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
+    if (
+      !isValidExpoToken(fcmToken) ||
+      !isValidLat(latitude) ||
+      !isValidLon(longitude)
+    ) {
+      return res.status(400).json({
+        error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
+      });
+    }
+
+    await withUsersWriteLock(async (users) => {
+      // ── Device de-duplication ─────────────────────────────────────────
+      // If the client sends a deviceId, remove any OTHER token that
+      // belongs to the same physical device. This prevents the same
+      // device from occupying multiple slots when its push token rotates.
+      if (typeof deviceId === "string" && deviceId.length > 0) {
+        for (const existingToken of Object.keys(users)) {
+          if (
+            existingToken !== fcmToken &&
+            users[existingToken]?.deviceId === deviceId
+          ) {
+            console.log(
+              `Removing stale token ${maskToken(existingToken)} for device ${deviceId.slice(0, 12)}…`,
+            );
+            delete users[existingToken];
+          }
+        }
+      }
+
+      // If the client detected token rotation, clean up the old token
+      if (
+        typeof previousToken === "string" &&
+        isValidExpoToken(previousToken) &&
+        previousToken !== fcmToken &&
+        users[previousToken]
+      ) {
+        console.log(
+          `Removing rotated token ${maskToken(previousToken)} (replaced by ${maskToken(fcmToken)})`,
+        );
+        delete users[previousToken];
+      }
+
+      users[fcmToken] = {
+        ...(users[fcmToken] || {}),
+        fcmToken,
+        deviceId:
+          typeof deviceId === "string" ? deviceId : users[fcmToken]?.deviceId,
+        latitude,
+        longitude,
+        appOpen: true,
+        activeAlertTypes: Array.isArray(users[fcmToken]?.activeAlertTypes)
+          ? users[fcmToken].activeAlertTypes
+          : [],
+        lastSeen: nowIso(),
+        registeredAt: users[fcmToken]?.registeredAt || nowIso(),
+      };
+      return true;
     });
+
+    console.log(
+      `Registered ${maskToken(fcmToken)} @ ${latitude.toFixed(3)}, ${longitude.toFixed(3)}`,
+    );
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Register error:", err);
+    return res.status(500).json({ error: "Internal server error" });
   }
-
-  await withUsersWriteLock(async (users) => {
-    users[fcmToken] = {
-      ...(users[fcmToken] || {}),
-      fcmToken,
-      latitude,
-      longitude,
-      appOpen: true,
-      activeAlertTypes: Array.isArray(users[fcmToken]?.activeAlertTypes)
-        ? users[fcmToken].activeAlertTypes
-        : [],
-      lastSeen: nowIso(),
-      registeredAt: users[fcmToken]?.registeredAt || nowIso(),
-    };
-    return true;
-  });
-
-  console.log(
-    `Registered ${maskToken(fcmToken)} @ ${latitude.toFixed(3)}, ${longitude.toFixed(3)}`,
-  );
-  return res.json({ success: true });
 });
 
 app.post("/update-location", enforceWriteGuards, async (req, res) => {
-  runtimeStats.updateLocationRequests += 1;
-  const { fcmToken, latitude, longitude, appOpen, activeAlertTypes } =
-    req.body || {};
-
-  if (
-    !isValidExpoToken(fcmToken) ||
-    !isValidLat(latitude) ||
-    !isValidLon(longitude)
-  ) {
-    return res.status(400).json({
-      error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
-    });
-  }
-
-  let skipped = false;
-
-  await withUsersWriteLock(async (users) => {
-    const existing = users[fcmToken] || {};
-    const nextAppOpen = typeof appOpen === "boolean" ? appOpen : false;
-
-    if (
-      typeof existing.latitude === "number" &&
-      typeof existing.longitude === "number" &&
-      typeof existing.appOpen === "boolean" &&
-      typeof existing.lastSeen === "string"
-    ) {
-      const lastSeenMs = Date.parse(existing.lastSeen);
-      const recentlyUpdated =
-        Number.isFinite(lastSeenMs) &&
-        Date.now() - lastSeenMs < LOCATION_UPDATE_MIN_INTERVAL_MS;
-      const sameAppState = existing.appOpen === nextAppOpen;
-      const sameLocation = isNearlySameLocation(
-        existing.latitude,
-        existing.longitude,
-        latitude,
-        longitude,
-      );
-
-      if (
-        recentlyUpdated &&
-        sameAppState &&
-        sameLocation &&
-        JSON.stringify(existing.activeAlertTypes) ===
-          JSON.stringify(activeAlertTypes)
-      ) {
-        skipped = true;
-        runtimeStats.updateLocationSkipped += 1;
-        return false;
-      }
-    }
-
-    users[fcmToken] = {
-      ...existing,
+  try {
+    runtimeStats.updateLocationRequests += 1;
+    const {
       fcmToken,
       latitude,
       longitude,
-      appOpen: nextAppOpen,
-      activeAlertTypes: Array.isArray(activeAlertTypes)
-        ? activeAlertTypes
-        : existing.activeAlertTypes || [],
-      lastSeen: nowIso(),
-    };
-    runtimeStats.updateLocationApplied += 1;
-    return true;
-  });
+      appOpen,
+      activeAlertTypes,
+      deviceId,
+    } = req.body || {};
 
-  return res.json({ success: true, skipped });
+    if (
+      !isValidExpoToken(fcmToken) ||
+      !isValidLat(latitude) ||
+      !isValidLon(longitude)
+    ) {
+      return res.status(400).json({
+        error: "Valid fcmToken (ExpoPushToken), latitude, longitude required",
+      });
+    }
+
+    let skipped = false;
+
+    await withUsersWriteLock(async (users) => {
+      // ── Device de-duplication (same as /register) ────────────────────
+      if (typeof deviceId === "string" && deviceId.length > 0) {
+        for (const existingToken of Object.keys(users)) {
+          if (
+            existingToken !== fcmToken &&
+            users[existingToken]?.deviceId === deviceId
+          ) {
+            delete users[existingToken];
+          }
+        }
+      }
+
+      const existing = users[fcmToken] || {};
+      const nextAppOpen = typeof appOpen === "boolean" ? appOpen : false;
+
+      if (
+        typeof existing.latitude === "number" &&
+        typeof existing.longitude === "number" &&
+        typeof existing.appOpen === "boolean" &&
+        typeof existing.lastSeen === "string"
+      ) {
+        const lastSeenMs = Date.parse(existing.lastSeen);
+        const recentlyUpdated =
+          Number.isFinite(lastSeenMs) &&
+          Date.now() - lastSeenMs < LOCATION_UPDATE_MIN_INTERVAL_MS;
+        const sameAppState = existing.appOpen === nextAppOpen;
+        const sameLocation = isNearlySameLocation(
+          existing.latitude,
+          existing.longitude,
+          latitude,
+          longitude,
+        );
+
+        if (
+          recentlyUpdated &&
+          sameAppState &&
+          sameLocation &&
+          JSON.stringify(existing.activeAlertTypes) ===
+            JSON.stringify(activeAlertTypes)
+        ) {
+          skipped = true;
+          runtimeStats.updateLocationSkipped += 1;
+          return false;
+        }
+      }
+
+      users[fcmToken] = {
+        ...existing,
+        fcmToken,
+        deviceId: typeof deviceId === "string" ? deviceId : existing.deviceId,
+        latitude,
+        longitude,
+        appOpen: nextAppOpen,
+        activeAlertTypes: Array.isArray(activeAlertTypes)
+          ? activeAlertTypes
+          : existing.activeAlertTypes || [],
+        lastSeen: nowIso(),
+      };
+      runtimeStats.updateLocationApplied += 1;
+      return true;
+    });
+
+    return res.json({ success: true, skipped });
+  } catch (err) {
+    console.error("Update-location error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 app.get("/check", async (req, res) => {
   if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  await runRiskCheck();
-  return res.json({ success: true });
+  try {
+    await runRiskCheck();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Risk check error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 app.get("/daily-summary", async (req, res) => {
   if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  await sendDailySummary();
-  return res.json({ success: true });
+  try {
+    await sendDailySummary();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Daily summary error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 app.get("/users", async (req, res) => {
   if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+  try {
+    const users = await getAllUsers();
+    const list = Object.values(users).map((u) => ({
+      token: maskToken(u.fcmToken),
+      latitude: u.latitude,
+      longitude: u.longitude,
+      appOpen: isUserAppOpen(u),
+      lastSeen: u.lastSeen,
+      activeAlertTypes: Array.isArray(u.activeAlertTypes)
+        ? u.activeAlertTypes
+        : [],
+    }));
 
-  const users = await getAllUsers();
-  const list = Object.values(users).map((u) => ({
-    token: maskToken(u.fcmToken),
-    latitude: u.latitude,
-    longitude: u.longitude,
-    appOpen: isUserAppOpen(u),
-    lastSeen: u.lastSeen,
-    activeAlertTypes: Array.isArray(u.activeAlertTypes)
-      ? u.activeAlertTypes
-      : [],
-  }));
-
-  return res.json({ count: list.length, users: list });
+    return res.json({ count: list.length, users: list });
+  } catch (err) {
+    console.error("Users list error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
 
 app.get("/stats", async (req, res) => {
   if (!isAuthorizedCronRequest(req)) {
     return res.status(401).json({ error: "Unauthorized" });
   }
+  try {
+    const users = await getAllUsers();
+    const all = Object.values(users);
+    const activeUsers = all.filter((u) => isUserAppOpen(u)).length;
 
-  const users = await getAllUsers();
-  const all = Object.values(users);
-  const activeUsers = all.filter((u) => isUserAppOpen(u)).length;
-
-  return res.json({
-    now: nowIso(),
-    users: {
-      total: all.length,
-      active: activeUsers,
-      inactive: all.length - activeUsers,
-    },
-    updates: {
-      requests: runtimeStats.updateLocationRequests,
-      applied: runtimeStats.updateLocationApplied,
-      skipped: runtimeStats.updateLocationSkipped,
-    },
-    jobs: {
-      riskChecksRun: runtimeStats.riskChecksRun,
-      riskChecksLastMs: runtimeStats.riskChecksLastMs,
-      riskChecksLastCheckedUsers: runtimeStats.riskChecksLastCheckedUsers,
-      dailySummariesRun: runtimeStats.dailySummariesRun,
-      dailySummariesLastMs: runtimeStats.dailySummariesLastMs,
-      prunesRun: runtimeStats.prunesRun,
-      prunesLastRemoved: runtimeStats.prunesLastRemoved,
-    },
-    cache: {
-      weatherEntries: weatherCache.size,
-      ttlMs: WEATHER_CACHE_TTL_MS,
-      coordPrecision: WEATHER_CACHE_COORD_PRECISION,
-      hits: runtimeStats.weatherCacheHits,
-      misses: runtimeStats.weatherCacheMisses,
-    },
-    registers: {
-      requests: runtimeStats.registerRequests,
-    },
-    uptimeSec: Math.round(process.uptime()),
-  });
+    return res.json({
+      now: nowIso(),
+      users: {
+        total: all.length,
+        active: activeUsers,
+        inactive: all.length - activeUsers,
+      },
+      updates: {
+        requests: runtimeStats.updateLocationRequests,
+        applied: runtimeStats.updateLocationApplied,
+        skipped: runtimeStats.updateLocationSkipped,
+      },
+      jobs: {
+        riskChecksRun: runtimeStats.riskChecksRun,
+        riskChecksLastMs: runtimeStats.riskChecksLastMs,
+        riskChecksLastCheckedUsers: runtimeStats.riskChecksLastCheckedUsers,
+        dailySummariesRun: runtimeStats.dailySummariesRun,
+        dailySummariesLastMs: runtimeStats.dailySummariesLastMs,
+        prunesRun: runtimeStats.prunesRun,
+        prunesLastRemoved: runtimeStats.prunesLastRemoved,
+      },
+      cache: {
+        weatherEntries: weatherCache.size,
+        ttlMs: WEATHER_CACHE_TTL_MS,
+        coordPrecision: WEATHER_CACHE_COORD_PRECISION,
+        hits: runtimeStats.weatherCacheHits,
+        misses: runtimeStats.weatherCacheMisses,
+      },
+      registers: {
+        requests: runtimeStats.registerRequests,
+      },
+      uptimeSec: Math.round(process.uptime()),
+    });
+  } catch (err) {
+    console.error("Stats error:", err);
+    return res.status(500).json({ error: "Internal server error" });
+  }
 });
+
+// ─── Periodic rate-limit bucket cleanup ──────────────────────────────────────
+// Prevents memory growth when no requests arrive for extended periods.
+setInterval(
+  () => {
+    const nowMs = Date.now();
+    cleanupRateLimitBuckets(writeIpBuckets, nowMs);
+    cleanupRateLimitBuckets(writeTokenBuckets, nowMs);
+  },
+  5 * 60 * 1000,
+);
 
 // ─── Cron ─────────────────────────────────────────────────────────────────────
 
