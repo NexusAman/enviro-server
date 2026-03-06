@@ -45,6 +45,23 @@ const RATE_LIMIT_MAX_WRITES_PER_TOKEN = Number(
   process.env.RATE_LIMIT_MAX_WRITES_PER_TOKEN || 60,
 );
 
+// ─── CPCB Integration ────────────────────────────────────────────────────────
+const CPCB_API_KEY = process.env.CPCB_API_KEY || "";
+const CPCB_URL =
+  "https://api.data.gov.in/resource/3b01bcb8-0b14-4abf-b6f2-c1bfd384ba69";
+const CPCB_CACHE_TTL_MS = Number(
+  process.env.CPCB_CACHE_TTL_MS || 30 * 60 * 1000,
+);
+const CPCB_MAX_DISTANCE_KM = 50;
+const CPCB_FRESHNESS_HOURS = 6;
+const CPCB_RECORDS_PER_PAGE = 1000;
+const CPCB_MAX_PAGES = 5;
+
+// ─── EMA Configuration (Exponential Moving Average) ──────────────────────────
+// EMA coefficient: 0.015 with 5-min checks gives an effective ~11-hour
+// weighted window, providing stable 24-hr-like AQI behavior.
+const EMA_ALPHA = 0.015;
+
 // ─── Thresholds aligned with Indian Standards (CPCB / IMD) ──────────────────
 const RISK_LIMITS = {
   // Overall AQI (NAQI / CPCB)
@@ -105,6 +122,10 @@ const runtimeStats = {
 const weatherCache = new Map();
 const writeIpBuckets = new Map();
 const writeTokenBuckets = new Map();
+
+// CPCB station cache (shared across all users — refreshed every 30 min)
+let cpcbStationsCache = null;
+let cpcbCachedAt = 0;
 
 const maskToken = (token) => {
   if (!token || token.length < 10) return "[invalid-token]";
@@ -300,7 +321,14 @@ function calcPM10(pm10) {
 
 function calculateOverallAQI(aq) {
   if (!aq) return 0;
-  return Math.max(calcPM25(aq.pm2_5), calcPM10(aq.pm10));
+  // Prefer CPCB official AQI when available (injected by risk check)
+  if (aq._cpcbAqi != null && aq._cpcbAqi > 0) return aq._cpcbAqi;
+
+  // Use EMA values if available for a smoother background alert behavior
+  const pm25 = aq._emaPM25 ?? aq.pm2_5;
+  const pm10 = aq._emaPM10 ?? aq.pm10;
+
+  return Math.max(calcPM25(pm25), calcPM10(pm10));
 }
 
 function getAQILabel(aqi) {
@@ -653,6 +681,134 @@ async function mapWithConcurrency(items, limit, worker) {
   await Promise.all(active);
 }
 
+// ─── CPCB Station Lookup ──────────────────────────────────────────────────────
+
+function haversine(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLon = ((lon2 - lon1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) *
+      Math.cos((lat2 * Math.PI) / 180) *
+      Math.sin(dLon / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function isCPCBTimestampFresh(lastUpdate) {
+  if (!lastUpdate) return false;
+  const parts = lastUpdate.match(
+    /^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2}):(\d{2})$/,
+  );
+  if (!parts) return false;
+  const [, dd, mm, yyyy, hh, min, ss] = parts;
+  const isoStr = `${yyyy}-${mm}-${dd}T${hh}:${min}:${ss}+05:30`;
+  const timestamp = Date.parse(isoStr);
+  if (!Number.isFinite(timestamp)) return false;
+  const ageMs = Date.now() - timestamp;
+  return ageMs >= 0 && ageMs <= CPCB_FRESHNESS_HOURS * 60 * 60 * 1000;
+}
+
+async function fetchAllCPCBStations() {
+  // Return cached data if fresh
+  if (cpcbStationsCache && Date.now() - cpcbCachedAt < CPCB_CACHE_TTL_MS) {
+    return cpcbStationsCache;
+  }
+
+  if (!CPCB_API_KEY) {
+    console.warn("CPCB_API_KEY not set — skipping CPCB integration.");
+    return [];
+  }
+
+  const allRecords = [];
+  let offset = 0;
+  for (let page = 0; page < CPCB_MAX_PAGES; page += 1) {
+    try {
+      const res = await fetchWithTimeout(
+        `${CPCB_URL}?api-key=${CPCB_API_KEY}&format=json&limit=${CPCB_RECORDS_PER_PAGE}&offset=${offset}`,
+        {},
+        FETCH_TIMEOUT_MS,
+      );
+      if (!res.ok) break;
+      const json = await res.json();
+      const records = json.records || [];
+      allRecords.push(...records);
+      if (records.length < CPCB_RECORDS_PER_PAGE) break;
+      offset += CPCB_RECORDS_PER_PAGE;
+    } catch {
+      break;
+    }
+  }
+
+  // Group into stations
+  const stationMap = {};
+  for (const r of allRecords) {
+    if (!r.station) continue;
+    const lat = parseFloat(r.latitude ?? "");
+    const lon = parseFloat(r.longitude ?? "");
+    if (isNaN(lat) || isNaN(lon)) continue;
+    if (!stationMap[r.station]) {
+      stationMap[r.station] = {
+        station: r.station,
+        city: r.city ?? "",
+        lat,
+        lon,
+        pollutants: {},
+        lastUpdated: r.last_update,
+      };
+    }
+    const pollutant = r.pollutant_id?.toUpperCase();
+    const value = parseFloat(r.avg_value ?? "");
+    if (isNaN(value)) continue;
+    if (pollutant === "PM2.5" || pollutant === "PM25")
+      stationMap[r.station].pollutants.pm25 = value;
+    else if (pollutant === "PM10")
+      stationMap[r.station].pollutants.pm10 = value;
+  }
+
+  const stations = Object.values(stationMap);
+  cpcbStationsCache = stations;
+  cpcbCachedAt = Date.now();
+  console.log(`CPCB cache refreshed: ${stations.length} stations`);
+  return stations;
+}
+
+/**
+ * Look up nearest CPCB station for a given coordinate.
+ * Returns { aqi, stationName, distanceKm } or null.
+ */
+async function getCPCBAQI(lat, lon) {
+  try {
+    const stations = await fetchAllCPCBStations();
+    let nearest = null;
+    let minDist = Infinity;
+    for (const s of stations) {
+      if (!s.pollutants.pm25 && !s.pollutants.pm10) continue;
+      const dist = haversine(lat, lon, s.lat, s.lon);
+      if (dist > CPCB_MAX_DISTANCE_KM) continue;
+      if (dist < minDist) {
+        minDist = dist;
+        nearest = s;
+      }
+    }
+    if (!nearest) return null;
+    if (!isCPCBTimestampFresh(nearest.lastUpdated)) return null;
+    const aqi = Math.max(
+      nearest.pollutants.pm25 != null ? calcPM25(nearest.pollutants.pm25) : 0,
+      nearest.pollutants.pm10 != null ? calcPM10(nearest.pollutants.pm10) : 0,
+    );
+    return aqi > 0
+      ? {
+          aqi,
+          stationName: nearest.station,
+          distanceKm: Math.round(minDist * 10) / 10,
+        }
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Jobs ─────────────────────────────────────────────────────────────────────
 
 async function runRiskCheck() {
@@ -689,7 +845,40 @@ async function runRiskCheck() {
     if (!user) return;
 
     try {
-      const weather = await fetchWeather(user.latitude, user.longitude);
+      const [weather, cpcb] = await Promise.all([
+        fetchWeather(user.latitude, user.longitude),
+        getCPCBAQI(user.latitude, user.longitude),
+      ]);
+
+      // If CPCB has fresh official AQI, override WeatherAPI's instant PM values
+      // so evaluateRisk uses the same AQI source as the client app.
+      if (cpcb && weather?.current?.air_quality) {
+        // Inject CPCB AQI-equivalent PM values into the weather data
+        // so calculateOverallAQI inside evaluateRisk produces the CPCB value.
+        weather.current.air_quality._cpcbAqi = cpcb.aqi;
+      }
+
+      // ── EMA Background Update ───────────────────────────────────────────
+      // Smooth out instant weather readings into a 24-hr-like background average
+      const aq = weather?.current?.air_quality;
+      if (aq && aq.pm2_5 != null && aq.pm10 != null) {
+        const oldEma25 = user.emaPM25 ?? aq.pm2_5;
+        const oldEma10 = user.emaPM10 ?? aq.pm10;
+
+        const nextEma25 = oldEma25 * (1 - EMA_ALPHA) + aq.pm2_5 * EMA_ALPHA;
+        const nextEma10 = oldEma10 * (1 - EMA_ALPHA) + aq.pm10 * EMA_ALPHA;
+
+        userUpdates.set(token, {
+          ...(userUpdates.get(token) || {}),
+          emaPM25: nextEma25,
+          emaPM10: nextEma10,
+        });
+
+        // Pass EMA values into evaluateRisk via the weather object
+        aq._emaPM25 = nextEma25;
+        aq._emaPM10 = nextEma10;
+      }
+
       const alerts = evaluateRisk(weather);
       const severeAlerts = alerts.filter(severeOrDanger);
       const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
@@ -802,9 +991,18 @@ async function sendDailySummary() {
     if (!user) return;
 
     try {
-      const weather = await fetchWeather(user.latitude, user.longitude);
+      const [weather, cpcb] = await Promise.all([
+        fetchWeather(user.latitude, user.longitude),
+        getCPCBAQI(user.latitude, user.longitude),
+      ]);
+
       const c = weather?.current;
       if (!c) return;
+
+      // Inject CPCB override for the summary
+      if (cpcb && c.air_quality) {
+        c.air_quality._cpcbAqi = cpcb.aqi;
+      }
 
       const aqi = calculateOverallAQI(c.air_quality);
       const aqiLabel = getAQILabel(aqi);
@@ -961,6 +1159,9 @@ app.post("/register", enforceWriteGuards, async (req, res) => {
           : [],
         lastSeen: nowIso(),
         registeredAt: users[fcmToken]?.registeredAt || nowIso(),
+        // Initialize EMA with app's values if provided
+        emaPM25: req.body?.avgPM25 ?? users[fcmToken]?.emaPM25,
+        emaPM10: req.body?.avgPM10 ?? users[fcmToken]?.emaPM10,
       };
       return true;
     });
@@ -1057,12 +1258,26 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
           ? activeAlertTypes
           : existing.activeAlertTypes || [],
         lastSeen: nowIso(),
+        // Warm up / Sync EMA with app's local averages
+        emaPM25: req.body?.avgPM25 ?? existing.emaPM25,
+        emaPM10: req.body?.avgPM10 ?? existing.emaPM10,
       };
       runtimeStats.updateLocationApplied += 1;
       return true;
     });
 
-    return res.json({ success: true, skipped });
+    // Return the server's current background average back to the app
+    const finalUsers = await getAllUsers();
+    const finalUser = finalUsers[fcmToken] || {};
+
+    return res.json({
+      success: true,
+      skipped,
+      ema: {
+        emaPM25: finalUser.emaPM25,
+        emaPM10: finalUser.emaPM10,
+      },
+    });
   } catch (err) {
     console.error("Update-location error:", err);
     return res.status(500).json({ error: "Internal server error" });
