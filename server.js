@@ -342,7 +342,7 @@ function getAQILabel(aqi) {
 
 // ─── Risk Evaluation (3-tier: warning / severe / danger) ────────────────────
 
-function evaluateRisk(weatherData) {
+function evaluateRisk(weatherData, isSensitive = false) {
   const alerts = [];
   const c = weatherData?.current;
   if (!c) return alerts;
@@ -359,6 +359,12 @@ function evaluateRisk(weatherData) {
   if (aq) {
     const aqi = calculateOverallAQI(aq);
 
+    // Personalization: Lower thresholds for sensitive groups
+    const warningThreshold = isSensitive ? 80 : RISK_LIMITS.AQI_WARNING;
+    const lightWarningThreshold = isSensitive
+      ? 51
+      : RISK_LIMITS.AQI_LIGHT_WARNING;
+
     if (aqi >= RISK_LIMITS.AQI_DANGER) {
       alerts.push({
         type: "AQI_danger",
@@ -371,17 +377,21 @@ function evaluateRisk(weatherData) {
         severity: "severe",
         message: `🚨 Very poor air — AQI ${aqi}. Respiratory illness risk, avoid outdoors.`,
       });
-    } else if (aqi >= RISK_LIMITS.AQI_WARNING) {
+    } else if (aqi >= warningThreshold) {
       alerts.push({
         type: "AQI_warning",
         severity: "warning",
-        message: `⚠️ Poor air quality — AQI ${aqi}. Health discomfort possible.`,
+        message: isSensitive
+          ? `⚠️ Sensitive Group Alert — AQI ${aqi}. High risk for respiratory conditions, stay indoors.`
+          : `⚠️ Poor air quality — AQI ${aqi}. Health discomfort possible.`,
       });
-    } else if (aqi >= RISK_LIMITS.AQI_LIGHT_WARNING) {
+    } else if (aqi >= lightWarningThreshold) {
       alerts.push({
         type: "AQI_light_warning",
         severity: "warning",
-        message: `💨 Moderate air — AQI ${aqi}. Sensitive groups should take caution.`,
+        message: isSensitive
+          ? `💨 Moderate air — AQI ${aqi}. Sensitive groups should limit outdoor exertion.`
+          : `💨 Moderate air — AQI ${aqi}. Sensitive groups should take caution.`,
       });
     }
   }
@@ -709,68 +719,84 @@ function isCPCBTimestampFresh(lastUpdate) {
   return ageMs >= 0 && ageMs <= CPCB_FRESHNESS_HOURS * 60 * 60 * 1000;
 }
 
+let cpcbFetchPromise = null;
+
 async function fetchAllCPCBStations() {
   // Return cached data if fresh
   if (cpcbStationsCache && Date.now() - cpcbCachedAt < CPCB_CACHE_TTL_MS) {
     return cpcbStationsCache;
   }
 
-  if (!CPCB_API_KEY) {
-    console.warn("CPCB_API_KEY not set — skipping CPCB integration.");
-    return [];
+  // If another thread is already fetching, wait for it instead of duplicating
+  if (cpcbFetchPromise) {
+    return cpcbFetchPromise;
   }
 
-  const allRecords = [];
-  let offset = 0;
-  for (let page = 0; page < CPCB_MAX_PAGES; page += 1) {
+  cpcbFetchPromise = (async () => {
     try {
-      const res = await fetchWithTimeout(
-        `${CPCB_URL}?api-key=${CPCB_API_KEY}&format=json&limit=${CPCB_RECORDS_PER_PAGE}&offset=${offset}`,
-        {},
-        FETCH_TIMEOUT_MS,
-      );
-      if (!res.ok) break;
-      const json = await res.json();
-      const records = json.records || [];
-      allRecords.push(...records);
-      if (records.length < CPCB_RECORDS_PER_PAGE) break;
-      offset += CPCB_RECORDS_PER_PAGE;
-    } catch {
-      break;
-    }
-  }
+      if (!CPCB_API_KEY) {
+        console.warn("CPCB_API_KEY not set — skipping CPCB integration.");
+        return [];
+      }
 
-  // Group into stations
-  const stationMap = {};
-  for (const r of allRecords) {
-    if (!r.station) continue;
-    const lat = parseFloat(r.latitude ?? "");
-    const lon = parseFloat(r.longitude ?? "");
-    if (isNaN(lat) || isNaN(lon)) continue;
-    if (!stationMap[r.station]) {
-      stationMap[r.station] = {
-        station: r.station,
-        city: r.city ?? "",
-        lat,
-        lon,
-        pollutants: {},
-        lastUpdated: r.last_update,
-      };
-    }
-    const pollutant = r.pollutant_id?.toUpperCase();
-    const value = parseFloat(r.avg_value ?? "");
-    if (isNaN(value)) continue;
-    if (pollutant === "PM2.5" || pollutant === "PM25")
-      stationMap[r.station].pollutants.pm25 = value;
-    else if (pollutant === "PM10")
-      stationMap[r.station].pollutants.pm10 = value;
-  }
+      const allRecords = [];
+      let offset = 0;
+      for (let page = 0; page < CPCB_MAX_PAGES; page += 1) {
+        try {
+          const res = await fetchWithTimeout(
+            `${CPCB_URL}?api-key=${CPCB_API_KEY}&format=json&limit=${CPCB_RECORDS_PER_PAGE}&offset=${offset}`,
+            {},
+            FETCH_TIMEOUT_MS,
+          );
+          if (!res.ok) break;
+          const json = await res.json();
+          const records = json.records || [];
+          allRecords.push(...records);
+          if (records.length < CPCB_RECORDS_PER_PAGE) break;
+          offset += CPCB_RECORDS_PER_PAGE;
+        } catch {
+          break;
+        }
+      }
 
-  const stations = Object.values(stationMap);
-  cpcbStationsCache = stations;
-  cpcbCachedAt = Date.now();
-  console.log(`CPCB cache refreshed: ${stations.length} stations`);
-  return stations;
+      // Group into stations
+      const stationMap = {};
+      for (const r of allRecords) {
+        if (!r.station) continue;
+        const lat = parseFloat(r.latitude ?? "");
+        const lon = parseFloat(r.longitude ?? "");
+        if (isNaN(lat) || isNaN(lon)) continue;
+        if (!stationMap[r.station]) {
+          stationMap[r.station] = {
+            station: r.station,
+            city: r.city ?? "",
+            lat,
+            lon,
+            pollutants: {},
+            lastUpdated: r.last_update,
+          };
+        }
+        const pollutant = r.pollutant_id?.toUpperCase();
+        const value = parseFloat(r.avg_value ?? "");
+        if (isNaN(value)) continue;
+        if (pollutant === "PM2.5" || pollutant === "PM25")
+          stationMap[r.station].pollutants.pm25 = value;
+        else if (pollutant === "PM10")
+          stationMap[r.station].pollutants.pm10 = value;
+      }
+
+      const stations = Object.values(stationMap);
+      cpcbStationsCache = stations;
+      cpcbCachedAt = Date.now();
+      console.log(`CPCB cache refreshed: ${stations.length} stations`);
+      return stations;
+    } finally {
+      // Always release the lock, even if the fetch fails
+      cpcbFetchPromise = null;
+    }
+  })();
+
+  return cpcbFetchPromise;
 }
 
 /**
@@ -879,7 +905,8 @@ async function runRiskCheck() {
         aq._emaPM10 = nextEma10;
       }
 
-      const alerts = evaluateRisk(weather);
+      // ── Evaluate Risk (using user's personalization profile if available) ──
+      const alerts = evaluateRisk(weather, user.isSensitive === true);
       const severeAlerts = alerts.filter(severeOrDanger);
       const nextActiveTypes = severeAlerts.map((a) => a.type).sort();
       const previousActiveTypes = Array.isArray(user.activeAlertTypes)
@@ -1101,8 +1128,14 @@ app.get("/health", (_req, res) => {
 app.post("/register", enforceWriteGuards, async (req, res) => {
   try {
     runtimeStats.registerRequests += 1;
-    const { fcmToken, latitude, longitude, deviceId, previousToken } =
-      req.body || {};
+    const {
+      fcmToken,
+      latitude,
+      longitude,
+      deviceId,
+      previousToken,
+      isSensitive,
+    } = req.body || {};
 
     if (
       !isValidExpoToken(fcmToken) ||
@@ -1162,6 +1195,10 @@ app.post("/register", enforceWriteGuards, async (req, res) => {
         // Initialize EMA with app's values if provided
         emaPM25: req.body?.avgPM25 ?? users[fcmToken]?.emaPM25,
         emaPM10: req.body?.avgPM10 ?? users[fcmToken]?.emaPM10,
+        isSensitive:
+          typeof isSensitive === "boolean"
+            ? isSensitive
+            : users[fcmToken]?.isSensitive || false,
       };
       return true;
     });
@@ -1186,6 +1223,7 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
       appOpen,
       activeAlertTypes,
       deviceId,
+      isSensitive,
     } = req.body || {};
 
     if (
@@ -1247,6 +1285,15 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
         }
       }
 
+      // ── Significant Move Detection (10km threshold) ─────────────────
+      // If the user has moved > 0.1 degrees, we reset the EMA to avoid
+      // old location data skewing the new area's alerts.
+      const hasMovedSignificantly =
+        typeof existing.latitude === "number" &&
+        typeof existing.longitude === "number" &&
+        (Math.abs(existing.latitude - latitude) > 0.1 ||
+          Math.abs(existing.longitude - longitude) > 0.1);
+
       users[fcmToken] = {
         ...existing,
         fcmToken,
@@ -1258,9 +1305,18 @@ app.post("/update-location", enforceWriteGuards, async (req, res) => {
           ? activeAlertTypes
           : existing.activeAlertTypes || [],
         lastSeen: nowIso(),
+        isSensitive:
+          typeof isSensitive === "boolean"
+            ? isSensitive
+            : existing.isSensitive || false,
         // Warm up / Sync EMA with app's local averages
-        emaPM25: req.body?.avgPM25 ?? existing.emaPM25,
-        emaPM10: req.body?.avgPM10 ?? existing.emaPM10,
+        // RESET logic: If moved significantly, ignore old EMA and start fresh
+        emaPM25: hasMovedSignificantly
+          ? (req.body?.avgPM25 ?? null)
+          : (req.body?.avgPM25 ?? existing.emaPM25),
+        emaPM10: hasMovedSignificantly
+          ? (req.body?.avgPM10 ?? null)
+          : (req.body?.avgPM10 ?? existing.emaPM10),
       };
       runtimeStats.updateLocationApplied += 1;
       return true;
