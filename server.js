@@ -118,8 +118,10 @@ const runtimeStats = {
   weatherCacheHits: 0,
   weatherCacheMisses: 0,
 };
-
 const weatherCache = new Map();
+const inFlightWeatherFetches = new Map();
+const omCache = new Map();
+const inFlightOMFetches = new Map();
 const writeIpBuckets = new Map();
 const writeTokenBuckets = new Map();
 
@@ -157,15 +159,30 @@ const pruneWeatherCache = () => {
       weatherCache.delete(key);
     }
   }
+  for (const [key, value] of omCache.entries()) {
+    if (now - value.cachedAt > WEATHER_CACHE_TTL_MS) {
+      omCache.delete(key);
+    }
+  }
 
-  if (weatherCache.size <= WEATHER_CACHE_MAX_ENTRIES) return;
+  if (weatherCache.size > WEATHER_CACHE_MAX_ENTRIES) {
+    const entries = Array.from(weatherCache.entries()).sort(
+      (a, b) => a[1].cachedAt - b[1].cachedAt,
+    );
+    const removeCount = weatherCache.size - WEATHER_CACHE_MAX_ENTRIES;
+    for (let i = 0; i < removeCount; i += 1) {
+      weatherCache.delete(entries[i][0]);
+    }
+  }
 
-  const entries = Array.from(weatherCache.entries()).sort(
-    (a, b) => a[1].cachedAt - b[1].cachedAt,
-  );
-  const removeCount = weatherCache.size - WEATHER_CACHE_MAX_ENTRIES;
-  for (let i = 0; i < removeCount; i += 1) {
-    weatherCache.delete(entries[i][0]);
+  if (omCache.size > WEATHER_CACHE_MAX_ENTRIES) {
+    const entries = Array.from(omCache.entries()).sort(
+      (a, b) => a[1].cachedAt - b[1].cachedAt,
+    );
+    const removeCount = omCache.size - WEATHER_CACHE_MAX_ENTRIES;
+    for (let i = 0; i < removeCount; i += 1) {
+      omCache.delete(entries[i][0]);
+    }
   }
 };
 
@@ -302,21 +319,64 @@ function interpolate(c, cLow, cHigh, iLow, iHigh) {
 function calcPM25(pm25) {
   if (pm25 == null) return 0;
   if (pm25 <= 30) return interpolate(pm25, 0, 30, 0, 50);
-  if (pm25 <= 60) return interpolate(pm25, 30.01, 60, 51, 100);
-  if (pm25 <= 90) return interpolate(pm25, 60.01, 90, 101, 200);
-  if (pm25 <= 120) return interpolate(pm25, 90.01, 120, 201, 300);
-  if (pm25 <= 250) return interpolate(pm25, 120.01, 250, 301, 400);
-  return interpolate(Math.min(pm25, 500), 250.01, 500, 401, 500);
+  if (pm25 <= 60) return interpolate(pm25, 30, 60, 51, 100);
+  if (pm25 <= 90) return interpolate(pm25, 60, 90, 101, 200);
+  if (pm25 <= 120) return interpolate(pm25, 90, 120, 201, 300);
+  if (pm25 <= 250) return interpolate(pm25, 120, 250, 301, 400);
+  return interpolate(Math.min(pm25, 1000), 250, 1000, 401, 500);
 }
 
 function calcPM10(pm10) {
   if (pm10 == null) return 0;
   if (pm10 <= 50) return interpolate(pm10, 0, 50, 0, 50);
-  if (pm10 <= 100) return interpolate(pm10, 50.01, 100, 51, 100);
-  if (pm10 <= 250) return interpolate(pm10, 100.01, 250, 101, 200);
-  if (pm10 <= 350) return interpolate(pm10, 250.01, 350, 201, 300);
-  if (pm10 <= 430) return interpolate(pm10, 350.01, 430, 301, 400);
-  return interpolate(Math.min(pm10, 600), 430.01, 600, 401, 500);
+  if (pm10 <= 100) return interpolate(pm10, 50, 100, 51, 100);
+  if (pm10 <= 250) return interpolate(pm10, 100, 250, 101, 200);
+  if (pm10 <= 350) return interpolate(pm10, 250, 350, 201, 300);
+  if (pm10 <= 430) return interpolate(pm10, 350, 430, 301, 400);
+  return interpolate(Math.min(pm10, 1000), 430, 1000, 401, 500);
+}
+
+// ─── Gas Pollutant Sub-index Functions (aligned with client aqi.ts) ─────────
+
+function calcO3(o3) {
+  if (o3 == null) return 0;
+  if (o3 <= 50) return interpolate(o3, 0, 50, 0, 50);
+  if (o3 <= 100) return interpolate(o3, 50, 100, 51, 100);
+  if (o3 <= 168) return interpolate(o3, 100, 168, 101, 200);
+  if (o3 <= 208) return interpolate(o3, 168, 208, 201, 300);
+  if (o3 <= 748) return interpolate(o3, 208, 748, 301, 400);
+  return interpolate(Math.min(o3, 1000), 748, 1000, 401, 500);
+}
+
+function calcCO(co) {
+  // co in mg/m³
+  if (co == null) return 0;
+  if (co <= 1) return interpolate(co, 0, 1, 0, 50);
+  if (co <= 2) return interpolate(co, 1, 2, 51, 100);
+  if (co <= 10) return interpolate(co, 2, 10, 101, 200);
+  if (co <= 17) return interpolate(co, 10, 17, 201, 300);
+  if (co <= 34) return interpolate(co, 17, 34, 301, 400);
+  return interpolate(Math.min(co, 100), 34, 100, 401, 500);
+}
+
+function calcNO2(no2) {
+  if (no2 == null) return 0;
+  if (no2 <= 40) return interpolate(no2, 0, 40, 0, 50);
+  if (no2 <= 80) return interpolate(no2, 40, 80, 51, 100);
+  if (no2 <= 180) return interpolate(no2, 80, 180, 101, 200);
+  if (no2 <= 280) return interpolate(no2, 180, 280, 201, 300);
+  if (no2 <= 400) return interpolate(no2, 280, 400, 301, 400);
+  return interpolate(Math.min(no2, 1000), 400, 1000, 401, 500);
+}
+
+function calcSO2(so2) {
+  if (so2 == null) return 0;
+  if (so2 <= 40) return interpolate(so2, 0, 40, 0, 50);
+  if (so2 <= 80) return interpolate(so2, 40, 80, 51, 100);
+  if (so2 <= 380) return interpolate(so2, 80, 380, 101, 200);
+  if (so2 <= 800) return interpolate(so2, 380, 800, 201, 300);
+  if (so2 <= 1600) return interpolate(so2, 800, 1600, 301, 400);
+  return interpolate(Math.min(so2, 2000), 1600, 2000, 401, 500);
 }
 
 function calculateOverallAQI(aq) {
@@ -328,7 +388,15 @@ function calculateOverallAQI(aq) {
   const pm25 = aq._emaPM25 ?? aq.pm2_5;
   const pm10 = aq._emaPM10 ?? aq.pm10;
 
-  return Math.max(calcPM25(pm25), calcPM10(pm10));
+  // Full NAQI: max sub-index across all available pollutants
+  return Math.max(
+    calcPM25(pm25),
+    calcPM10(pm10),
+    calcNO2(aq.no2),
+    calcSO2(aq.so2),
+    calcO3(aq.o3),
+    calcCO(aq.co != null ? aq.co / 1000 : null), // WeatherAPI CO is µg/m³, CPCB expects mg/m³
+  );
 }
 
 function getAQILabel(aqi) {
@@ -575,35 +643,171 @@ async function fetchWeather(lat, lon) {
     return cached.data;
   }
 
+  // ── FIX: Cache Stampede (Return in-flight promise if one exists) ──
+  if (inFlightWeatherFetches.has(cacheKey)) {
+    runtimeStats.weatherCacheHits += 1; // Counted as a hit to avoid DB duplicate
+    return inFlightWeatherFetches.get(cacheKey);
+  }
+
   runtimeStats.weatherCacheMisses += 1;
 
-  const url = `https://api.weatherapi.com/v1/current.json?key=${key}&q=${lat},${lon}&aqi=yes`;
-  let lastError = null;
+  // ── FIX: Removed aqi=yes to match client (which bans WeatherAPI pollution) ──
+  const url = `https://api.weatherapi.com/v1/current.json?key=${key}&q=${lat},${lon}&aqi=no`;
 
-  for (let attempt = 1; attempt <= 2; attempt += 1) {
-    try {
-      const res = await fetchWithTimeout(url, {}, FETCH_TIMEOUT_MS);
-      if (!res.ok) {
-        if (res.status >= 500 && attempt < 2) {
+  const fetchPromise = (async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const res = await fetchWithTimeout(url, {}, FETCH_TIMEOUT_MS);
+        if (!res.ok) {
+          if (res.status >= 500 && attempt < 2) {
+            await new Promise((r) => setTimeout(r, 500 * attempt));
+            continue;
+          }
+          throw new Error(`WeatherAPI error: ${res.status}`);
+        }
+        const data = await res.json();
+        // Ensure air_quality shell exists for riskEngine even if aqi=no
+        if (data.current && !data.current.air_quality) {
+          data.current.air_quality = {};
+        }
+        weatherCache.set(cacheKey, { data, cachedAt: Date.now() });
+        pruneWeatherCache();
+        return data;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 2) {
           await new Promise((r) => setTimeout(r, 500 * attempt));
           continue;
         }
-        throw new Error(`WeatherAPI error: ${res.status}`);
-      }
-      const data = await res.json();
-      weatherCache.set(cacheKey, { data, cachedAt: Date.now() });
-      pruneWeatherCache();
-      return data;
-    } catch (err) {
-      lastError = err;
-      if (attempt < 2) {
-        await new Promise((r) => setTimeout(r, 500 * attempt));
-        continue;
       }
     }
+    throw lastError || new Error("Weather fetch failed");
+  })();
+
+  inFlightWeatherFetches.set(cacheKey, fetchPromise);
+
+  try {
+    return await fetchPromise;
+  } finally {
+    inFlightWeatherFetches.delete(cacheKey);
+  }
+}
+
+// ── FIX: Add Open-Meteo Server Sync Engine ─────────────────────────────────────
+async function fetchOpenMeteo(lat, lon) {
+  const cacheKey = getWeatherCacheKey(lat, lon);
+  const cached = omCache.get(cacheKey);
+  if (cached && Date.now() - cached.cachedAt <= WEATHER_CACHE_TTL_MS) {
+    return cached.data;
   }
 
-  throw lastError || new Error("Weather fetch failed");
+  if (inFlightOMFetches.has(cacheKey)) {
+    return inFlightOMFetches.get(cacheKey);
+  }
+
+  const url = `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${lat}&longitude=${lon}&hourly=pm2_5,pm10,carbon_monoxide,nitrogen_dioxide,ozone,sulphur_dioxide&timezone=auto&past_days=2`;
+
+  const fetchPromise = (async () => {
+    let lastError = null;
+    for (let attempt = 1; attempt <= 2; attempt += 1) {
+      try {
+        const res = await fetchWithTimeout(url, {}, FETCH_TIMEOUT_MS);
+        if (!res.ok) {
+          if (res.status >= 500 && attempt < 2) {
+            await new Promise((r) => setTimeout(r, 500 * attempt));
+            continue;
+          }
+          throw new Error(`OpenMeteo error: ${res.status}`);
+        }
+        const json = await res.json();
+        const h = json.hourly;
+        if (!h) throw new Error("No hourly data in OpenMeteo response");
+
+        // Helper functions mirroring client openMeteoService math
+        const nowMs = Date.now();
+        let idx = h.time.length - 1;
+        for (let i = 0; i < h.time.length; i++) {
+          if (new Date(h.time[i]).getTime() > nowMs) {
+            idx = Math.max(0, i - 1);
+            break;
+          }
+        }
+
+        const avg = (arr, endIdx, n) => {
+          let sum = 0;
+          let count = 0;
+          for (let i = endIdx; i >= Math.max(0, endIdx - n + 1); i--) {
+            if (arr[i] != null && isFinite(arr[i])) {
+              sum += arr[i];
+              count++;
+            }
+          }
+          return count > 0 ? sum / count : null;
+        };
+
+        const max8h = (arr, endIdx) => {
+          let maxV = null;
+          for (let i = endIdx; i >= Math.max(0, endIdx - 23); i--) {
+            const val = avg(arr, i, 8);
+            if (val != null && (maxV === null || val > maxV)) maxV = val;
+          }
+          return maxV;
+        };
+
+        const pm25 = avg(h.pm2_5, idx, 24);
+        const pm10 = avg(h.pm10, idx, 24);
+        const no2 = avg(h.nitrogen_dioxide, idx, 24);
+        const so2 = avg(h.sulphur_dioxide, idx, 24);
+        const o3 = max8h(h.ozone, idx);
+        const rawCo = max8h(h.carbon_monoxide, idx);
+        const co = rawCo != null ? rawCo / 1000 : null; // µg/m³ -> mg/m³
+
+        // Clamp values like client does
+        const clamp = (v, min, max) => Math.max(min, Math.min(v, max));
+        const finalObj = {
+          pm2_5: pm25 != null ? clamp(pm25, 0, 1000) : null,
+          pm10: pm10 != null ? clamp(pm10, 0, 1000) : null,
+          no2: no2 != null ? clamp(no2, 0, 1000) : null,
+          so2: so2 != null ? clamp(so2, 0, 2000) : null,
+          o3: o3 != null ? clamp(o3, 0, 1000) : null,
+          co: co != null ? clamp(co, 0, 100) : null,
+        };
+
+        // Compute local OM AQI mirroring CPCB NAQI logic
+        const aqi = Math.max(
+          finalObj.pm2_5 != null ? calcPM25(finalObj.pm2_5) : 0,
+          finalObj.pm10 != null ? calcPM10(finalObj.pm10) : 0,
+          finalObj.no2 != null ? calcNO2(finalObj.no2) : 0,
+          finalObj.so2 != null ? calcSO2(finalObj.so2) : 0,
+          finalObj.o3 != null ? calcO3(finalObj.o3) : 0,
+          finalObj.co != null ? calcCO(finalObj.co) : 0,
+        );
+        finalObj.aqi = aqi > 0 ? aqi : 0;
+
+        omCache.set(cacheKey, { data: finalObj, cachedAt: Date.now() });
+        pruneWeatherCache();
+        return finalObj;
+      } catch (err) {
+        lastError = err;
+        if (attempt < 2) {
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+          continue;
+        }
+      }
+    }
+    // Return null silently on failure to avoid crashing weather pipeline
+    console.warn(`[OpenMeteo] fetch failed: ${lastError?.message}`);
+    return null;
+  })();
+
+  inFlightOMFetches.set(cacheKey, fetchPromise);
+
+  try {
+    return await fetchPromise;
+  } finally {
+    inFlightOMFetches.delete(cacheKey);
+  }
 }
 
 async function sendPush(token, title, body, data = {}, color = undefined) {
@@ -783,6 +987,16 @@ async function fetchAllCPCBStations() {
           stationMap[r.station].pollutants.pm25 = value;
         else if (pollutant === "PM10")
           stationMap[r.station].pollutants.pm10 = value;
+        else if (pollutant === "NO2")
+          stationMap[r.station].pollutants.no2 = value;
+        else if (pollutant === "SO2")
+          stationMap[r.station].pollutants.so2 = value;
+        else if (pollutant === "OZONE" || pollutant === "O3")
+          stationMap[r.station].pollutants.o3 = value;
+        else if (pollutant === "CO")
+          stationMap[r.station].pollutants.co = value / 1000; // µg/m³ → mg/m³
+        else if (pollutant === "NH3")
+          stationMap[r.station].pollutants.nh3 = value;
       }
 
       const stations = Object.values(stationMap);
@@ -819,9 +1033,14 @@ async function getCPCBAQI(lat, lon) {
     }
     if (!nearest) return null;
     if (!isCPCBTimestampFresh(nearest.lastUpdated)) return null;
+    const p = nearest.pollutants;
     const aqi = Math.max(
-      nearest.pollutants.pm25 != null ? calcPM25(nearest.pollutants.pm25) : 0,
-      nearest.pollutants.pm10 != null ? calcPM10(nearest.pollutants.pm10) : 0,
+      p.pm25 != null ? calcPM25(p.pm25) : 0,
+      p.pm10 != null ? calcPM10(p.pm10) : 0,
+      p.no2 != null ? calcNO2(p.no2) : 0,
+      p.so2 != null ? calcSO2(p.so2) : 0,
+      p.o3 != null ? calcO3(p.o3) : 0,
+      p.co != null ? calcCO(p.co) : 0,
     );
     return aqi > 0
       ? {
@@ -871,38 +1090,60 @@ async function runRiskCheck() {
     if (!user) return;
 
     try {
-      const [weather, cpcb] = await Promise.all([
+      // ── CONCURRENTLY FETCH ALL 3 ENGINES (WeatherAPI, CPCB, OpenMeteo) ──
+      const [weather, cpcb, om] = await Promise.all([
         fetchWeather(user.latitude, user.longitude),
         getCPCBAQI(user.latitude, user.longitude),
+        fetchOpenMeteo(user.latitude, user.longitude),
       ]);
 
-      // If CPCB has fresh official AQI, override WeatherAPI's instant PM values
-      // so evaluateRisk uses the same AQI source as the client app.
-      if (cpcb && weather?.current?.air_quality) {
-        // Inject CPCB AQI-equivalent PM values into the weather data
-        // so calculateOverallAQI inside evaluateRisk produces the CPCB value.
-        weather.current.air_quality._cpcbAqi = cpcb.aqi;
+      // ── HYBRID SYNC: ALIGN SERVER AQI ENGINE WITH CLIENT ──
+      if (weather && weather.current) {
+        weather.current.air_quality = weather.current.air_quality || {};
+
+        // 1. If CPCB has fresh official data, use it (highest priority)
+        if (cpcb) {
+          weather.current.air_quality._cpcbAqi = cpcb.aqi;
+        }
+        // 2. Otherwise use Open-Meteo mathematical fallback (second priority)
+        else if (om) {
+          weather.current.air_quality.pm2_5 = om.pm2_5;
+          weather.current.air_quality.pm10 = om.pm10;
+          weather.current.air_quality.no2 = om.no2;
+          weather.current.air_quality.so2 = om.so2;
+          weather.current.air_quality.co = om.co;
+          weather.current.air_quality.o3 = om.o3;
+          weather.current.air_quality._cpcbAqi = om.aqi;
+        }
+        // 3. Otherwise, if both fail, the air_quality object remains empty,
+        // and evaluateRisk natively generates no AQI alerts.
       }
 
       // ── EMA Background Update ───────────────────────────────────────────
       // Smooth out instant weather readings into a 24-hr-like background average
+      // Each PM is updated independently — a missing sensor should not block the other
       const aq = weather?.current?.air_quality;
-      if (aq && aq.pm2_5 != null && aq.pm10 != null) {
-        const oldEma25 = user.emaPM25 ?? aq.pm2_5;
-        const oldEma10 = user.emaPM10 ?? aq.pm10;
+      if (aq) {
+        const emaUpdate = {};
 
-        const nextEma25 = oldEma25 * (1 - EMA_ALPHA) + aq.pm2_5 * EMA_ALPHA;
-        const nextEma10 = oldEma10 * (1 - EMA_ALPHA) + aq.pm10 * EMA_ALPHA;
+        if (aq.pm2_5 != null) {
+          const oldEma25 = user.emaPM25 ?? aq.pm2_5;
+          emaUpdate.emaPM25 = oldEma25 * (1 - EMA_ALPHA) + aq.pm2_5 * EMA_ALPHA;
+          aq._emaPM25 = emaUpdate.emaPM25;
+        }
 
-        userUpdates.set(token, {
-          ...(userUpdates.get(token) || {}),
-          emaPM25: nextEma25,
-          emaPM10: nextEma10,
-        });
+        if (aq.pm10 != null) {
+          const oldEma10 = user.emaPM10 ?? aq.pm10;
+          emaUpdate.emaPM10 = oldEma10 * (1 - EMA_ALPHA) + aq.pm10 * EMA_ALPHA;
+          aq._emaPM10 = emaUpdate.emaPM10;
+        }
 
-        // Pass EMA values into evaluateRisk via the weather object
-        aq._emaPM25 = nextEma25;
-        aq._emaPM10 = nextEma10;
+        if (Object.keys(emaUpdate).length > 0) {
+          userUpdates.set(token, {
+            ...(userUpdates.get(token) || {}),
+            ...emaUpdate,
+          });
+        }
       }
 
       // ── Evaluate Risk (using user's personalization profile if available) ──
@@ -1018,17 +1259,27 @@ async function sendDailySummary() {
     if (!user) return;
 
     try {
-      const [weather, cpcb] = await Promise.all([
+      const [weather, cpcb, om] = await Promise.all([
         fetchWeather(user.latitude, user.longitude),
         getCPCBAQI(user.latitude, user.longitude),
+        fetchOpenMeteo(user.latitude, user.longitude),
       ]);
 
       const c = weather?.current;
       if (!c) return;
+      c.air_quality = c.air_quality || {};
 
-      // Inject CPCB override for the summary
-      if (cpcb && c.air_quality) {
+      // Inject CPCB or OM override for the summary
+      if (cpcb) {
         c.air_quality._cpcbAqi = cpcb.aqi;
+      } else if (om) {
+        c.air_quality.pm2_5 = om.pm2_5;
+        c.air_quality.pm10 = om.pm10;
+        c.air_quality.no2 = om.no2;
+        c.air_quality.so2 = om.so2;
+        c.air_quality.co = om.co;
+        c.air_quality.o3 = om.o3;
+        c.air_quality._cpcbAqi = om.aqi;
       }
 
       const aqi = calculateOverallAQI(c.air_quality);
